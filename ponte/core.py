@@ -12,7 +12,7 @@ import subprocess
 import sys
 from typing import Optional
 
-from rpcli.config import TunnelConfig, get_config
+from ponte.config import TunnelConfig, get_config
 
 __all__ = ["TunnelManager"]
 
@@ -38,7 +38,7 @@ class TunnelManager:
     """Manage a single SSH reverse-tunnel session.
 
     Parameters:
-        config: A validated :class:`TunnelConfig` (from ``rpcli.config``).
+        config: A validated :class:`TunnelConfig` (from ``ponte.config``).
     """
 
     def __init__(self, config: TunnelConfig) -> None:

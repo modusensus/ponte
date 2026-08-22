@@ -30,8 +30,8 @@ local_port = 7897
 description = "Windows proxy"
 
 [daemon]
-pid_file = "C:\\ssh-tunnel\\rpcli.pid"
-log_file = "C:\\ssh-tunnel\\rpcli.log"
+pid_file = "C:\\ssh-tunnel\\ponte.pid"
+log_file = "C:\\ssh-tunnel\\ponte.log"
 log_max_bytes = 10485760   # 10 MB
 log_backup_count = 3
 

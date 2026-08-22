@@ -1,11 +1,11 @@
-"""Command-line interface for rpcli — an SSH reverse tunnel manager.
+"""Command-line interface for ponte — an SSH reverse tunnel manager.
 
 Typical usage::
 
-    rpcli start          # launch the tunnel daemon in the background
-    rpcli status         # inspect daemon health and remote ports
-    rpcli logs -f        # follow the daemon log
-    rpcli install        # register a Windows scheduled task (auto-start)
+    ponte start          # launch the tunnel daemon in the background
+    ponte status         # inspect daemon health and remote ports
+    ponte logs -f        # follow the daemon log
+    ponte install        # register a Windows scheduled task (auto-start)
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
-from rpcli.config import get_config
+from ponte.config import get_config
 
 __all__ = ["app"]
 
@@ -62,11 +62,11 @@ _FOLLOW_POLL_INTERVAL = 0.25
 def _daemon() -> "TunnelDaemon":
     """Return a daemon instance bound to the effective configuration.
 
-    The ``rpcli.daemon`` module is imported lazily so that config-only
+    The ``ponte.daemon`` module is imported lazily so that config-only
     commands (``config``, ``--help``) keep working even when the daemon
     module is unavailable or out of date.
     """
-    from rpcli.daemon import TunnelDaemon
+    from ponte.daemon import TunnelDaemon
 
     return TunnelDaemon(config=get_config())
 
@@ -116,7 +116,7 @@ def start(
 
         pid = daemon.start()
         console.print(f"[green]已启动，pid {pid}[/green]")
-        console.print("[dim]可运行 rpcli status 查看健康[/dim]")
+        console.print("[dim]可运行 ponte status 查看健康[/dim]")
     except typer.Exit:
         raise
     except Exception as exc:
@@ -156,7 +156,7 @@ def restart() -> None:
                 console.print("[grey]已停止旧进程[/grey]")
         pid = daemon.start()
         console.print(f"[green]已重启，pid {pid}[/green]")
-        console.print("[dim]可运行 rpcli status 查看健康[/dim]")
+        console.print("[dim]可运行 ponte status 查看健康[/dim]")
     except typer.Exit:
         raise
     except Exception as exc:
@@ -174,10 +174,10 @@ def status() -> None:
     try:
         s = _daemon().status()
         if not s.running:
-            console.print("[grey]未运行（可 rpcli start 启动）[/grey]")
+            console.print("[grey]未运行（可 ponte start 启动）[/grey]")
             raise typer.Exit(code=0)
 
-        table = Table(title="rpcli 状态", header_style="bold cyan")
+        table = Table(title="ponte 状态", header_style="bold cyan")
         table.add_column("项目", no_wrap=True, style="cyan")
         table.add_column("值")
 

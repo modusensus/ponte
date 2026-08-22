@@ -1,4 +1,4 @@
-"""rpcli — SSH Reverse Proxy CLI
+"""ponte — SSH Reverse Proxy CLI
 
 A robust CLI tool for managing persistent SSH reverse tunnels.
 """

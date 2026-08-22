@@ -1,4 +1,4 @@
-# rpcli — SSH 反向隧道持久守护 CLI
+# ponte — SSH 反向隧道持久守护 CLI
 
 一个 Python 写的持久 SSH 反向隧道守护工具：隧道掉线后由进程内无限次指数退避 + 抖动重连自动拉回，并有系统计划任务做开机自启与进程级兜底，解决"SSH 隧道断线后不再恢复"的老大难问题。
 
@@ -25,7 +25,7 @@
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│                     rpcli（本地守护进程，Python）                       │
+│                     ponte（本地守护进程，Python）                       │
 │                                                                      │
 │   main.py ──▶ daemon.py ──▶ retry.py  ──▶ core.py ──▶ ssh.exe -N -R  │
 │    (typer     (生命周期     (无限退避       (纯 SSH       root@47.113.   │
@@ -57,7 +57,7 @@
 
 ```
 C:\ssh-tunnel\
-├─ rpcli\                 # rpcli 包源码
+├─ ponte\                 # ponte 包源码
 │  ├─ __init__.py         # 版本号
 │  ├─ main.py             # typer CLI 入口
 │  ├─ daemon.py           # 生命周期编排
@@ -69,8 +69,8 @@ C:\ssh-tunnel\
 ├─ _smoke_test.py         # 冒烟测试（不连外网）
 ├─ id_rsa / id_rsa.pub    # SSH 身份密钥（⚠️ 不入库，自备）
 ├─ known_hosts            # 显式 UserKnownHostsFile
-├─ rpcli.bat              # Windows 启动入口（可选，放入 PATH）
-└─ rpcli.log / rpcli.pid / rpcli.status.json / rpcli.stop
+├─ ponte.bat              # Windows 启动入口（可选，放入 PATH）
+└─ ponte.log / ponte.pid / ponte.status.json / ponte.stop
                           # daemon 运行时文件（⚠️ 不入库）
 ```
 
@@ -90,7 +90,7 @@ pip install typer rich
 
 ---
 
-## 配置说明（`rpcli/config.toml`）
+## 配置说明（`ponte/config.toml`）
 
 所有路径支持 `~` 展开；identity 文件与 known_hosts 文件必须在配置校验时真实存在，否则启动即报错。
 
@@ -129,21 +129,21 @@ local_port = 7897
 
 ## 使用
 
-假设 `C:\ssh-tunnel` 已在 `PATH`（或直接用 `python -m rpcli.main ...`）：
+假设 `C:\ssh-tunnel` 已在 `PATH`（或直接用 `python -m ponte.main ...`）：
 
 ```bash
-rpcli start                 # 后台启动守护进程（写 PID，脱离终端）
-rpcli start --foreground    # 前台启动，日志直接打到终端（调试用）
-rpcli stop                  # 优雅停止：先停计划任务，再标记退出；20s 无响应则 taskkill /T /F
-rpcli restart               # 停旧起新
-rpcli status                # 查看本地进程 / 远程端口 / 计划任务状态
-rpcli logs -n 50            # 查看最近 50 行日志
-rpcli logs --follow         # 跟读日志（类似 tail -f）
-rpcli test                  # 快速测 SSH 连通性（ssh … echo OK）
-rpcli check                 # 本地进程 + 远程端口健康检查
-rpcli install               # 注册计划任务：开机自启 + RestartCount=999
-rpcli uninstall             # 卸载计划任务并停止隧道
-rpcli config                # 打印当前生效配置
+ponte start                 # 后台启动守护进程（写 PID，脱离终端）
+ponte start --foreground    # 前台启动，日志直接打到终端（调试用）
+ponte stop                  # 优雅停止：先停计划任务，再标记退出；20s 无响应则 taskkill /T /F
+ponte restart               # 停旧起新
+ponte status                # 查看本地进程 / 远程端口 / 计划任务状态
+ponte logs -n 50            # 查看最近 50 行日志
+ponte logs --follow         # 跟读日志（类似 tail -f）
+ponte test                  # 快速测 SSH 连通性（ssh … echo OK）
+ponte check                 # 本地进程 + 远程端口健康检查
+ponte install               # 注册计划任务：开机自启 + RestartCount=999
+ponte uninstall             # 卸载计划任务并停止隧道
+ponte config                # 打印当前生效配置
 ```
 
 ---
@@ -156,7 +156,7 @@ rpcli config                # 打印当前生效配置
 
 ### 停止流程
 
-`stop` 依序执行：先停掉计划任务（防止兜底把进程再拉起）→ 写 `rpcli.stop` 停止标记 → 优雅终止 SSH 子进程 → 20 秒无响应则 `taskkill /T /F` 连进程树强杀。
+`stop` 依序执行：先停掉计划任务（防止兜底把进程再拉起）→ 写 `ponte.stop` 停止标记 → 优雅终止 SSH 子进程 → 20 秒无响应则 `taskkill /T /F` 连进程树强杀。
 
 ---
 
@@ -167,13 +167,13 @@ rpcli config                # 打印当前生效配置
 | 「Permission denied (publickey) 身份认证失败」 | 私钥 `C:\ssh-tunnel\id_rsa` 是否已有对应公钥在服务器 `~/.ssh/authorized_keys`；Windows 下私钥文件权限不要存在"继承给其他用户"，必要时 `icacls id_rsa /inheritance:r /grant:r 石晴:(R)` |
 | 首次/换 key 后连接被拒 | 删除 `C:\ssh-tunnel\known_hosts`，用 `StrictHostKeyChecking=accept-new`（配置默认）重新连接，重新写入指纹 |
 | 隧道进程活着但远程端口不通 | 阿里云 **安全组** 是否放行了入方向的 `23334` / `17897`；服务器上 `ss -tlnp` 确认端口确实在监听 |
-| 排查日志 | 主日志 `C:\ssh-tunnel\rpcli.log`（10MB × 3 滚动）；`rpcli logs -n 100 --follow` 实时跟看 |
+| 排查日志 | 主日志 `C:\ssh-tunnel\ponte.log`（10MB × 3 滚动）；`ponte logs -n 100 --follow` 实时跟看 |
 
 ---
 
 ## 开发与测试
 
-`C:\ssh-tunnel\_smoke_test.py` 是纯本地冒烟测试：在导入真实模块前用临时 stub 替换 `rpcli.config` 与 `rpcli.core`，只测 `retry.py` 与 `health.py` 的纯逻辑（退避序列、抖动范围、`max_retries=0` 无限重试、`MAX_RETRIES_REACHED` 终止、`run_loop` 停止与回调异常吞并等），**不连外网、不 spawn SSH**。
+`C:\ssh-tunnel\_smoke_test.py` 是纯本地冒烟测试：在导入真实模块前用临时 stub 替换 `ponte.config` 与 `ponte.core`，只测 `retry.py` 与 `health.py` 的纯逻辑（退避序列、抖动范围、`max_retries=0` 无限重试、`MAX_RETRIES_REACHED` 终止、`run_loop` 停止与回调异常吞并等），**不连外网、不 spawn SSH**。
 
 ```bash
 python C:\ssh-tunnel\_smoke_test.py
@@ -186,4 +186,4 @@ python C:\ssh-tunnel\_smoke_test.py
 ## 注意事项
 
 - **`id_rsa` 私钥绝不计入仓库**：`.gitignore` 已排除 `id_rsa` / `id_rsa.pub`，新环境需自行放置密钥文件。
-- `known_hosts`、`config.toml`、`rpcli.bat`、`rpcli/` 源码、`_smoke_test.py` 均入库保留；daemon 运行时文件（`rpcli.pid` / `rpcli.status.json` / `rpcli.stop` / `rpcli.log*`）不入库。
+- `known_hosts`、`config.toml`、`ponte.bat`、`ponte/` 源码、`_smoke_test.py` 均入库保留；daemon 运行时文件（`ponte.pid` / `ponte.status.json` / `ponte.stop` / `ponte.log*`）不入库。

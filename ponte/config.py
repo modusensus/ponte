@@ -1,4 +1,4 @@
-"""Configuration loading and validation for the rpcli SSH reverse tunnel tool.
+"""Configuration loading and validation for the ponte SSH reverse tunnel tool.
 
 Loads ``config.toml`` using :mod:`tomllib` (Python 3.11+) with a fallback to
 the third-party ``tomli`` package on older interpreters, and exposes validated
