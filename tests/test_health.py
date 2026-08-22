@@ -6,6 +6,8 @@ import threading
 import time
 from typing import Optional
 
+import pytest
+
 from ponte.config import HealthConfig
 from ponte.health import HealthChecker, HealthStatus
 
@@ -112,3 +114,34 @@ def test_run_loop_callback_error_swallowed() -> None:
     time.sleep(0.15)
     stop.set()
     assert isinstance(hc.last_callback_error, ValueError)
+
+
+def test_health_status_str() -> None:
+    s = HealthStatus(
+        process_alive=True,
+        remote_ports={23334: True, 17897: False},
+        all_healthy=False,
+        timestamp=time.time(),
+        error="probe failed",
+    )
+    text = str(s)
+    assert "process=alive" in text
+    assert "23334" in text
+    assert "ok" in text
+    assert "17897" in text
+    assert "down" in text
+    assert "healthy=False" in text
+    assert "probe failed" in text
+
+
+def test_run_loop_rejects_negative_interval() -> None:
+    hc = HealthChecker(_TM(alive=True, ports="dict"), _hc())
+    with pytest.raises(ValueError):
+        hc.run_loop(interval=-1)
+
+
+def test_check_remote_ports_type_error() -> None:
+    hc = HealthChecker(_TM(alive=True, ports="bad"), _hc())
+    s = hc.check()
+    assert s.all_healthy is False
+    assert "TypeError" in (s.error or "")
