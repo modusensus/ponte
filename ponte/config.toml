@@ -2,11 +2,12 @@
 # All paths support ~ for home directory expansion
 
 [ssh]
-host = "47.113.179.249"
+host = "YOUR_SERVER_IP"
 port = 22
-user = "root"
-identity_file = "C:\\ssh-tunnel\\id_rsa"
-known_hosts_file = "C:\\ssh-tunnel\\known_hosts"
+user = "YOUR_SSH_USER"
+# 按各平台 SSH 惯例放密钥即可（~ 自动展开）；如需自定义路径请直接改这里
+identity_file = "~/.ssh/id_rsa"
+known_hosts_file = "~/.ssh/known_hosts"
 
 [ssh.options]
 StrictHostKeyChecking = "accept-new"
@@ -30,8 +31,13 @@ local_port = 7897
 description = "Windows proxy"
 
 [daemon]
-pid_file = "C:\\ssh-tunnel\\ponte.pid"
-log_file = "C:\\ssh-tunnel\\ponte.log"
+# pid_file / log_file 缺省时按平台自动选择：
+#   Windows: %LOCALAPPDATA%\ponte\
+#   Linux:   ~/.local/state/ponte/
+#   macOS:   ~/Library/Application Support/ponte/
+# 需要自定义时在此指定，支持 ~ 展开。
+# pid_file = "C:\\ssh-tunnel\\ponte.pid"
+# log_file = "C:\\ssh-tunnel\\ponte.log"
 log_max_bytes = 10485760   # 10 MB
 log_backup_count = 3
 
@@ -47,7 +53,13 @@ check_interval = 60        # seconds
 remote_check_enabled = true
 remote_check_timeout = 10  # seconds
 
+[service]
+# 开机自启服务身份（Linux systemd 单元名 / macOS launchd label 前缀）
+name = "ponte"
+autostart = true
+kill_timeout = 5           # POSIX 优雅终止等待秒数，超时后 SIGKILL
+
 [windows]
-# Scheduled Task configuration
+# 仅 Windows 使用
 task_name = "SSH-Reverse-Tunnel"
 ssh_exe = "D:\\Git\\usr\\bin\\ssh.exe"

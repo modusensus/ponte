@@ -72,6 +72,21 @@ def _encode_ps(script: str) -> str:
     return base64.b64encode(script.encode("utf-16-le")).decode("ascii")
 
 
+def _decode_console(data: bytes) -> str:
+    """Decode bytes from a Windows console process, tolerating GBK/ANSI output.
+
+    PowerShell (and other console tools) on Chinese Windows emit the active
+    code page (GBK) rather than UTF-8. Try UTF-8 first, then fall back to
+    ``gbk`` with lossy replacement so a mis-decode never raises.
+    """
+    if not data:
+        return ""
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("gbk", errors="replace")
+
+
 @dataclasses.dataclass
 class DaemonStatus:
     """A snapshot of daemon state for the ``status``/``stop`` commands."""
@@ -126,6 +141,7 @@ class TunnelDaemon:
     # -- PID helpers -----------------------------------------------------------
 
     def write_pid(self) -> None:
+        os.makedirs(os.path.dirname(self.pid_file), exist_ok=True)
         with open(self.pid_file, "w", encoding="utf-8") as handle:
             handle.write(str(os.getpid()))
 
@@ -302,26 +318,38 @@ class TunnelDaemon:
         In background mode the daemon re-spawns itself detached and the parent
         returns the child PID once it writes its PID file.
         """
-        if not foreground and sys.platform == "win32":
+        if not foreground:
             return self._spawn_background()
         return self.run()
 
     def _spawn_background(self) -> int:
-        """Re-launch this CLI as a detached process running in the foreground."""
-        flags = (
-            subprocess.DETACHED_PROCESS
-            | subprocess.CREATE_NEW_PROCESS_GROUP
-            | subprocess.CREATE_NO_WINDOW
-        )
+        """Re-launch this CLI as a detached background process."""
         cmd = [sys.executable, "-m", "ponte.main", "start", "--foreground"]
-        subprocess.Popen(
-            cmd,
-            cwd=self._root_dir,
-            creationflags=flags,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        if sys.platform == "win32":
+            flags = (
+                subprocess.DETACHED_PROCESS
+                | subprocess.CREATE_NEW_PROCESS_GROUP
+                | subprocess.CREATE_NO_WINDOW
+            )
+            subprocess.Popen(
+                cmd,
+                cwd=self._root_dir,
+                creationflags=flags,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        else:
+            # POSIX: start a new session so the child detaches from the
+            # controlling terminal and survives the parent shell exiting.
+            subprocess.Popen(
+                cmd,
+                cwd=self._root_dir,
+                start_new_session=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
         # Wait for the child to write its PID file (up to 10 s).
         for _ in range(100):
             pid = self.read_pid()
@@ -343,12 +371,8 @@ class TunnelDaemon:
         if not status.running or status.pid is None:
             return status
 
-        # 1. Stop the scheduled task first so it cannot restart the daemon.
-        try:
-            if sys.platform == "win32":
-                self._run_powershell_stop_task()
-        except Exception as exc:  # noqa: BLE001 - best effort
-            logger.debug("could not stop scheduled task: %s", exc)
+        # 1. Stop the auto-start hook first so it cannot restart the daemon.
+        self._stop_autostart()
 
         # 2. Drop the stop marker for a graceful shutdown.
         try:
@@ -374,15 +398,32 @@ class TunnelDaemon:
         return self.status()
 
     def _force_kill(self, pid: int) -> None:
-        """Kill *pid* and its whole tree, regardless of platform."""
+        """Kill *pid* and its whole tree, regardless of platform.
+
+        On Windows the whole process tree is killed. On POSIX we first send a
+        graceful ``SIGTERM`` and only escalate to ``SIGKILL`` after the
+        configured grace period, so the daemon gets a chance to clean up.
+        """
         if sys.platform == "win32":
             subprocess.run(
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
                 capture_output=True,
                 text=True,
             )
-        else:
-            os.kill(pid, signal.SIGKILL)
+            return
+        # POSIX: graceful SIGTERM, then escalate to SIGKILL.
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        deadline = time.monotonic() + self.config.service.kill_timeout
+        while time.monotonic() < deadline and self._pid_alive(pid):
+            time.sleep(0.2)
+        if self._pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
     # -- Status ----------------------------------------------------------------
 
@@ -415,6 +456,164 @@ class TunnelDaemon:
         """Probe which configured remote ports are currently listening."""
         return TunnelManager(self.config).check_remote_ports(timeout=timeout)
 
+    # -- Cross-platform service install ----------------------------------------
+
+    def install_service(self) -> str:
+        """Register OS-level auto-start + crash-restart for the daemon.
+
+        Dispatches to the platform backend: Windows Scheduled Task, a systemd
+        *user* unit on Linux, or a launchd LaunchAgent on macOS.
+        """
+        if sys.platform == "win32":
+            return self.install_scheduled_task()
+        if sys.platform == "linux":
+            return self._install_systemd()
+        if sys.platform == "darwin":
+            return self._install_launchd()
+        raise RuntimeError(f"service install not supported on {sys.platform}")
+
+    def uninstall_service(self) -> str:
+        """Remove the auto-start service registered by :meth:`install_service`."""
+        if sys.platform == "win32":
+            return self.uninstall_scheduled_task()
+        if sys.platform == "linux":
+            return self._uninstall_systemd()
+        if sys.platform == "darwin":
+            return self._uninstall_launchd()
+        raise RuntimeError(f"service uninstall not supported on {sys.platform}")
+
+    def _stop_autostart(self) -> None:
+        """Best-effort: stop the auto-start hook so it cannot respawn us."""
+        try:
+            if sys.platform == "win32":
+                self._run_powershell_stop_task()
+            elif sys.platform == "linux":
+                name = self.config.service.name
+                subprocess.run(
+                    ["systemctl", "--user", "stop", f"{name}.service"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            elif sys.platform == "darwin":
+                plist = self._launchd_plist()
+                subprocess.run(
+                    ["launchctl", "unload", plist],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+        except Exception as exc:  # noqa: BLE001 - best effort
+            logger.debug("could not stop service autostart: %s", exc)
+
+    def _launchd_plist(self) -> str:
+        """Return the per-user LaunchAgent plist path (reverse-DNS label)."""
+        label = f"com.modusensus.{self.config.service.name}"
+        return os.path.join(
+            os.path.expanduser("~/Library/LaunchAgents"), f"{label}.plist"
+        )
+
+    def _install_systemd(self) -> str:
+        """Write a systemd *user* unit and enable+start it."""
+        name = self.config.service.name
+        unit_dir = os.path.expanduser("~/.config/systemd/user")
+        os.makedirs(unit_dir, exist_ok=True)
+        unit_path = os.path.join(unit_dir, f"{name}.service")
+        unit = (
+            "[Unit]\n"
+            f"Description=ponte SSH reverse tunnel daemon ({name})\n"
+            "After=network-online.target\n"
+            "Wants=network-online.target\n"
+            "\n"
+            "[Service]\n"
+            "Type=simple\n"
+            f"ExecStart={sys.executable} -m ponte.main start --foreground\n"
+            f"WorkingDirectory={self._root_dir}\n"
+            "Restart=always\n"
+            "RestartSec=15\n"
+            "Environment=PYTHONUNBUFFERED=1\n"
+            "\n"
+            "[Install]\n"
+            "WantedBy=default.target\n"
+        )
+        with open(unit_path, "w", encoding="utf-8") as handle:
+            handle.write(unit)
+        subprocess.run(
+            ["systemctl", "--user", "daemon-reload"],
+            check=True, capture_output=True, text=True,
+        )
+        subprocess.run(
+            ["systemctl", "--user", "enable", "--now", f"{name}.service"],
+            check=True, capture_output=True, text=True,
+        )
+        return "installed"
+
+    def _uninstall_systemd(self) -> str:
+        """Disable+stop the systemd user unit and remove the file."""
+        name = self.config.service.name
+        subprocess.run(
+            ["systemctl", "--user", "disable", "--now", f"{name}.service"],
+            capture_output=True, text=True, check=False,
+        )
+        unit_path = os.path.join(
+            os.path.expanduser("~/.config/systemd/user"), f"{name}.service"
+        )
+        if os.path.exists(unit_path):
+            os.remove(unit_path)
+        subprocess.run(
+            ["systemctl", "--user", "daemon-reload"],
+            capture_output=True, text=True, check=False,
+        )
+        return "uninstalled"
+
+    def _install_launchd(self) -> str:
+        """Write a LaunchAgent plist and load it (auto-start + KeepAlive)."""
+        plist_path = self._launchd_plist()
+        os.makedirs(os.path.dirname(plist_path), exist_ok=True)
+        label = f"com.modusensus.{self.config.service.name}"
+        plist = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+            '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+            '<plist version="1.0">\n'
+            "<dict>\n"
+            f"    <key>Label</key><string>{label}</string>\n"
+            "    <key>ProgramArguments</key>\n"
+            "    <array>\n"
+            f"        <string>{sys.executable}</string>\n"
+            "        <string>-m</string>\n"
+            "        <string>ponte.main</string>\n"
+            "        <string>start</string>\n"
+            "        <string>--foreground</string>\n"
+            "    </array>\n"
+            f"    <key>WorkingDirectory</key><string>{self._root_dir}</string>\n"
+            "    <key>RunAtLoad</key><true/>\n"
+            "    <key>KeepAlive</key><true/>\n"
+            "    <key>ProcessType</key><string>Background</string>\n"
+            f"    <key>StandardOutPath</key><string>{self.log_file}</string>\n"
+            f"    <key>StandardErrorPath</key><string>{self.log_file}</string>\n"
+            "</dict>\n"
+            "</plist>\n"
+        )
+        with open(plist_path, "w", encoding="utf-8") as handle:
+            handle.write(plist)
+        subprocess.run(
+            ["launchctl", "load", "-w", plist_path],
+            check=True, capture_output=True, text=True,
+        )
+        return "installed"
+
+    def _uninstall_launchd(self) -> str:
+        """Unload and remove the LaunchAgent plist."""
+        plist_path = self._launchd_plist()
+        subprocess.run(
+            ["launchctl", "unload", "-w", plist_path],
+            capture_output=True, text=True, check=False,
+        )
+        if os.path.exists(plist_path):
+            os.remove(plist_path)
+        return "uninstalled"
+
     # -- Windows Scheduled Task ------------------------------------------------
 
     def install_scheduled_task(self) -> str:
@@ -429,22 +628,12 @@ class TunnelDaemon:
         exe = self._pythonw_path()
         task_name = self.config.windows.task_name
         script = f"""
-$action = New-ScheduledTaskAction \\
-    -Execute '{exe}' \\
-    -Argument '-m ponte.main start --foreground' \\
-    -WorkingDirectory '{self._root_dir}'
+$ErrorActionPreference = 'Stop'
+$action = New-ScheduledTaskAction -Execute '{exe}' -Argument '-m ponte.main start --foreground' -WorkingDirectory '{self._root_dir}'
 $trigger = New-ScheduledTaskTrigger -AtStartup
-$settings = New-ScheduledTaskSettingsSet \\
-    -RestartCount 999 \\
-    -RestartInterval (New-TimeSpan -Minutes 1) \\
-    -ExecutionTimeLimit (New-TimeSpan -Seconds 0) \\
-    -AllowStartIfOnBatteries \\
-    -DontStopIfGoingOnBatteries
-$principal = New-ScheduledTaskPrincipal \\
-    -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-Register-ScheduledTask -TaskName '{task_name}' \\
-    -Action $action -Trigger $trigger -Settings $settings \\
-    -Principal $principal -Force | Out-Null
+$settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+$principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+Register-ScheduledTask -TaskName '{task_name}' -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
 Write-Output 'installed'
 """
         return self._run_powershell(script).strip()
@@ -485,14 +674,18 @@ Write-Output 'installed'
         ]
         flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, creationflags=flags
+            cmd, capture_output=True, timeout=timeout, creationflags=flags
         )
+        # PowerShell writes ANSI/GBK on Chinese systems; decode defensively so a
+        # garbled line never masks the real exit code / stderr below.
+        stdout = _decode_console(result.stdout)
+        stderr = _decode_console(result.stderr)
         if result.returncode != 0:
             raise RuntimeError(
                 f"PowerShell exited {result.returncode}: "
-                f"{(result.stderr or result.stdout).strip()}"
+                f"{(stderr or stdout).strip()}"
             )
-        return result.stdout
+        return stdout
 
     # -- Logging ---------------------------------------------------------------
 
@@ -504,6 +697,7 @@ Write-Output 'installed'
         root.setLevel(logging.INFO)
         max_bytes = self.config.daemon.log_max_bytes
         backups = self.config.daemon.log_backup_count
+        os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
         handler = logging.handlers.RotatingFileHandler(
             self.log_file,
             maxBytes=max_bytes,

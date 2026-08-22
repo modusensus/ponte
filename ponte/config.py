@@ -8,6 +8,7 @@ dataclasses through a process-wide cached accessor, :func:`get_config`.
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional, Union
 
@@ -29,6 +30,7 @@ __all__ = [
     "RetryConfig",
     "HealthConfig",
     "WindowsConfig",
+    "ServiceConfig",
     "get_config",
     "load_config",
 ]
@@ -167,6 +169,32 @@ class WindowsConfig:
 
 
 @dataclass(frozen=True)
+class ServiceConfig:
+    """Cross-platform service identity / install knobs (systemd, launchd, …)."""
+
+    name: str = "ponte"
+    autostart: bool = True
+    kill_timeout: float = 5.0
+
+
+def _default_state_dir() -> str:
+    """Return a per-user directory for pid/log/status files.
+
+    … location varies by OS so the tool works out of the box on
+    Windows, Linux and macOS without hardcoding ``C:\\ssh-tunnel``.
+    """
+    if sys.platform == "win32":
+        return os.path.join(
+            os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+            "ponte",
+        )
+    if sys.platform == "darwin":
+        return os.path.join(os.path.expanduser("~"), "Library", "Application Support", "ponte")
+    xdg = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(xdg, "ponte")
+
+
+@dataclass(frozen=True)
 class TunnelConfig:
     """Top-level validated configuration for the tool."""
 
@@ -176,6 +204,7 @@ class TunnelConfig:
     retry: RetryConfig = field(default_factory=RetryConfig)
     health: HealthConfig = field(default_factory=HealthConfig)
     windows: WindowsConfig = field(default_factory=WindowsConfig)
+    service: ServiceConfig = field(default_factory=ServiceConfig)
     source_path: str = ""
     """Absolute path of the TOML file this configuration was loaded from."""
 
@@ -244,6 +273,7 @@ def _parse_config(data: Mapping[str, Any], config_path: str) -> TunnelConfig:
     retry = _parse_retry(data.get("retry", {}))
     health = _parse_health(data.get("health", {}))
     windows = _parse_windows(data.get("windows", {}))
+    service = _parse_service(data.get("service", {}))
 
     cfg = TunnelConfig(
         ssh=ssh,
@@ -252,6 +282,7 @@ def _parse_config(data: Mapping[str, Any], config_path: str) -> TunnelConfig:
         retry=retry,
         health=health,
         windows=windows,
+        service=service,
         source_path=config_path,
     )
     _validate(cfg)
@@ -319,8 +350,9 @@ def _parse_tunnels(section: Any) -> list[Tunnel]:
 
 def _parse_daemon(section: Any) -> DaemonConfig:
     if not section:
-        return DaemonConfig()
+        section = {}
     _expect_table(section, "daemon")
+    state_dir = _default_state_dir()
     pid_file = _optional_str(section, "pid_file", default="")
     log_file = _optional_str(section, "log_file", default="")
     log_max_bytes = _optional_int(
@@ -330,8 +362,8 @@ def _parse_daemon(section: Any) -> DaemonConfig:
         section, "log_backup_count", default=DaemonConfig().log_backup_count, minimum=0, where="daemon"
     )
     return DaemonConfig(
-        pid_file=_expand(pid_file) if pid_file else "",
-        log_file=_expand(log_file) if log_file else "",
+        pid_file=_expand(pid_file) if pid_file else os.path.join(state_dir, "ponte.pid"),
+        log_file=_expand(log_file) if log_file else os.path.join(state_dir, "ponte.log"),
         log_max_bytes=log_max_bytes,
         log_backup_count=log_backup_count,
     )
@@ -380,6 +412,20 @@ def _parse_windows(section: Any) -> WindowsConfig:
     return WindowsConfig(
         task_name=task_name,
         ssh_exe=_expand(ssh_exe) if ssh_exe else None,
+    )
+
+
+def _parse_service(section: Any) -> ServiceConfig:
+    if not section:
+        return ServiceConfig()
+    _expect_table(section, "service")
+    dft = ServiceConfig()
+    return ServiceConfig(
+        name=_optional_str(section, "name", default=dft.name),
+        autostart=_optional_bool(section, "autostart", default=dft.autostart, where="service"),
+        kill_timeout=_optional_number(
+            section, "kill_timeout", default=dft.kill_timeout, minimum=0.0, where="service"
+        ),
     )
 
 
