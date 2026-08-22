@@ -311,14 +311,11 @@ def check(
 
 @app.command()
 def install() -> None:
-    """注册 Windows 计划任务（开机自启 + 崩溃重启）。"""
-    if sys.platform != "win32":
-        err_console.print("[bold red]错误：仅支持 Windows（开机自启）[/bold red]")
-        raise typer.Exit(code=1)
+    """注册开机自启 + 崩溃重启（按平台：计划任务 / systemd / launchd）。"""
     try:
         daemon = _daemon()
-        message = daemon.install_scheduled_task()
-        console.print("[green]已注册计划任务（开机自启 + 崩溃重启）[/green]")
+        message = daemon.install_service()
+        console.print("[green]已注册开机自启服务（崩溃自动重启）[/green]")
         if message:
             console.print(f"[dim]{escape(message)}[/dim]")
     except typer.Exit:
@@ -329,11 +326,11 @@ def install() -> None:
 
 @app.command()
 def uninstall() -> None:
-    """移除已注册的 Windows 计划任务。"""
+    """移除已注册的开机自启服务。"""
     try:
         daemon = _daemon()
-        message = daemon.uninstall_scheduled_task()
-        console.print("[green]已移除计划任务[/green]")
+        message = daemon.uninstall_service()
+        console.print("[green]已移除开机自启服务[/green]")
         if message:
             console.print(f"[dim]{escape(message)}[/dim]")
     except typer.Exit:

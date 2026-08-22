@@ -7,6 +7,15 @@ __pycache__/
 *.pyc
 *.pyo
 
+# 虚拟环境
+.venv/
+venv/
+
+# 覆盖率产物
+.coverage
+coverage.xml
+htmlcov/
+
 # ponte 守护进程运行时文件
 ponte.pid
 ponte.status.json
@@ -17,6 +26,8 @@ ponte.log.*
 # 开发临时文件
 _scratch.py
 _wtest.txt
+_inspect.ps1
+_fix_ponte_task.ps1
 # SSH known_hosts（运行时自动写入，不入库）
 known_hosts
 known_hosts.old

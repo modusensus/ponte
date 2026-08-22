@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import subprocess
 import sys
 from typing import Optional
@@ -22,8 +23,13 @@ logger = logging.getLogger(__name__)
 def _find_ssh() -> str:
     """Return the path to the ``ssh`` executable.
 
-    On Windows the config may specify an explicit path; otherwise ``ssh`` is
-    resolved from ``PATH``.
+    Resolution order:
+
+    1. On Windows, the config may specify an explicit path
+       (``[windows] ssh_exe``); honour it if it exists.
+    2. ``ssh`` found on ``PATH`` (Linux/macOS almost always, Git-for-Windows
+       often adds it too).
+    3. Windows fallbacks to common Git installation paths.
     """
     cfg = get_config()
     if sys.platform == "win32" and cfg.windows.ssh_exe:
@@ -31,6 +37,20 @@ def _find_ssh() -> str:
         if os.path.isfile(exe):
             return exe
         logger.warning("Configured ssh_exe not found: %s, falling back to PATH", exe)
+
+    found = shutil.which("ssh")
+    if found:
+        return found
+
+    if sys.platform == "win32":
+        for candidate in (
+            r"D:\Git\usr\bin\ssh.exe",
+            r"C:\Program Files\Git\usr\bin\ssh.exe",
+            r"C:\Program Files (x86)\Git\usr\bin\ssh.exe",
+        ):
+            if os.path.isfile(candidate):
+                return candidate
+        logger.warning("ssh not found on PATH or Git fallback; trying 'ssh' verbatim")
     return "ssh"
 
 
@@ -103,7 +123,7 @@ class TunnelManager:
         Example::
 
             ["ssh", "-o", "ServerAliveInterval=30", "-N",
-             "-R", "23334:localhost:2222", "root@47.113.179.249"]
+             "-R", "23334:localhost:2222", "user@server-ip"]
         """
         cfg = self.config.ssh
         args = [self.ssh_exe]
@@ -173,14 +193,39 @@ class TunnelManager:
     def check_remote_ports(self, timeout: int = 10) -> dict[int, bool]:
         """Connect to the server and check which tunnel ports are listening.
 
-        Returns a ``{port: is_listening}`` mapping.
+        The probe runs *on the server*. It prefers a pure-Python socket check
+        (no external tools), falling back to ``ss``/``lsof``/``netstat`` for
+        servers without python3. Returns a ``{port: is_listening}`` mapping.
         """
         cfg = self.config.ssh
         ports = {t.remote_port for t in self.config.tunnels}
         if not ports:
             return {}
 
-        grep_pattern = "|".join(str(p) for p in ports)
+        port_literal = ", ".join(str(p) for p in sorted(ports))
+        # python3 socket probe first (portable across server OSes), else
+        # fall back to the common listener tools with `ss`-style output.
+        remote_cmd = (
+            "if command -v python3 >/dev/null 2>&1; then\n"
+            "python3 - <<'PY'\n"
+            "import socket\n"
+            f"ports=[{port_literal}]\n"
+            "open_ports=[]\n"
+            "for p in ports:\n"
+            "    s=socket.socket(); s.settimeout(1)\n"
+            "    try:\n"
+            "        s.connect(('127.0.0.1',p)); open_ports.append(p)\n"
+            "    except OSError:\n"
+            "        pass\n"
+            "    finally:\n"
+            "        s.close()\n"
+            "print(' '.join(str(p) for p in open_ports))\n"
+            "PY\n"
+            "else\n"
+            "(ss -tlnp 2>/dev/null || lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null || netstat -tln 2>/dev/null)\n"
+            "fi"
+        )
+
         args = [self.ssh_exe]
         for key, value in cfg.options.as_pairs():
             args.extend(["-o", f"{key}={value}"])
@@ -192,7 +237,7 @@ class TunnelManager:
         args.extend([
             "-o", f"ConnectTimeout={timeout}",
             cfg.destination,
-            f"ss -tlnp | grep -E '{grep_pattern}'",
+            remote_cmd,
         ])
         try:
             result = subprocess.run(
@@ -205,8 +250,13 @@ class TunnelManager:
             logger.debug("Remote port check failed: %s", exc)
             return {p: False for p in ports}
 
-        output = result.stdout
+        output = result.stdout or ""
+        # python3 branch prints the open ports space-separated on one line.
+        python_ports = {int(p) for p in output.split() if p.isdigit()}
         status: dict[int, bool] = {}
         for port in ports:
-            status[port] = f":{port} " in output
+            # Either the python3 line named the port, or a tool listing
+            # contains a ``:<port> `` token (e.g. ``*:23334 ``).
+            in_tool_output = f":{port} " in output or f":{port}\n" in output
+            status[port] = port in python_ports or in_tool_output
         return status
