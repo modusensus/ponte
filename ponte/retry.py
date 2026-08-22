@@ -1,4 +1,4 @@
-"""Retry and resilience layer for the rpcli SSH reverse tunnel manager.
+"""Retry and resilience layer for the ponte SSH reverse tunnel manager.
 
 This module wraps :meth:`TunnelManager.connect` with reconnect logic:
 exponential backoff, optional jitter, and a configurable retry budget.
@@ -7,7 +7,7 @@ The runner is a *generator-driven* state machine. The driving code (e.g. a
 CLI ``for`` loop or an event pump) iterates over :meth:`RetryRunner.run` and
 receives one :class:`RetryEvent` at a time::
 
-    from rpcli.retry import RetryRunner, RetryEvent
+    from ponte.retry import RetryRunner, RetryEvent
 
     runner = RetryRunner(get_config().retry)
     for event in runner.run(manager):
@@ -30,8 +30,8 @@ import threading
 import time
 from typing import Iterator, Optional
 
-from rpcli.config import RetryConfig
-from rpcli.core import TunnelManager
+from ponte.config import RetryConfig
+from ponte.core import TunnelManager
 
 __all__ = ["RetryEvent", "RetryRunner"]
 
@@ -139,7 +139,7 @@ class RetryEvent:
 class RetryRunner:
     """Wrap a :class:`TunnelManager` with reconnect and backoff behaviour.
 
-    The ``config`` argument is a :class:`RetryConfig` (from ``rpcli.config``)
+    The ``config`` argument is a :class:`RetryConfig` (from ``ponte.config``)
     carrying the ``[retry]`` section of ``config.toml``. Used fields:
 
     * ``max_retries``    — how many times to reconnect after the initial

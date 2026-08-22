@@ -1,8 +1,8 @@
 import importlib.util, sys, types, threading, time, dataclasses
 
-# --- Stub out rpcli.config and rpcli.core before importing the real modules ---
-pkg = types.ModuleType("rpcli"); pkg.__path__ = []
-pkg2 = types.ModuleType("rpcli.config")
+# --- Stub out ponte.config and ponte.core before importing the real modules ---
+pkg = types.ModuleType("ponte"); pkg.__path__ = []
+pkg2 = types.ModuleType("ponte.config")
 pkg2.get_config = lambda: None
 
 @dataclasses.dataclass
@@ -21,7 +21,7 @@ class _HC:
     remote_check_timeout: float
 pkg2.HealthConfig = _HC
 
-pkg3 = types.ModuleType("rpcli.core")
+pkg3 = types.ModuleType("ponte.core")
 @dataclasses.dataclass
 class _TM:
     process = None
@@ -31,19 +31,19 @@ class _TM:
     def build_args(self): ...
 pkg3.TunnelManager = _TM
 
-sys.modules["rpcli"] = pkg
-sys.modules["rpcli.config"] = pkg2
-sys.modules["rpcli.core"] = pkg3
+sys.modules["ponte"] = pkg
+sys.modules["ponte.config"] = pkg2
+sys.modules["ponte.core"] = pkg3
 
 def load(name, path):
-    spec = importlib.util.spec_from_file_location("rpcli." + name, path)
+    spec = importlib.util.spec_from_file_location("ponte." + name, path)
     mod = importlib.util.module_from_spec(spec)
-    sys.modules["rpcli." + name] = mod
+    sys.modules["ponte." + name] = mod
     spec.loader.exec_module(mod)
     return mod
 
-retry = load("retry", "rpcli/retry.py")
-health = load("health", "rpcli/health.py")
+retry = load("retry", "ponte/retry.py")
+health = load("health", "ponte/health.py")
 
 # ================= Test RetryRunner =================
 class FakeManager:

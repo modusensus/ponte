@@ -1,11 +1,11 @@
-"""Daemon / process-lifecycle management for the rpcli tunnel manager.
+"""Daemon / process-lifecycle management for the ponte tunnel manager.
 
 This module orchestrates the three layers below it into a single long-running
 process:
 
-* :mod:`rpcli.core`   — establish and tear down a single SSH session
-* :mod:`rpcli.retry`  — exponential-backoff reconnect state machine
-* :mod:`rpcli.health` — periodic liveness and remote-port checks
+* :mod:`ponte.core`   — establish and tear down a single SSH session
+* :mod:`ponte.retry`  — exponential-backoff reconnect state machine
+* :mod:`ponte.health` — periodic liveness and remote-port checks
 
 ``TunnelDaemon.run()`` runs the retry loop in the *foreground* (blocking) so a
 Scheduled Task, a service wrapper, or the CLI's background mode can all drive
@@ -34,10 +34,10 @@ import threading
 import time
 from typing import Callable, Optional
 
-from rpcli.config import TunnelConfig, get_config
-from rpcli.core import TunnelManager
-from rpcli.health import HealthChecker, HealthStatus
-from rpcli.retry import RetryEvent, RetryRunner
+from ponte.config import TunnelConfig, get_config
+from ponte.core import TunnelManager
+from ponte.health import HealthChecker, HealthStatus
+from ponte.retry import RetryEvent, RetryRunner
 
 __all__ = ["DaemonStatus", "TunnelDaemon"]
 
@@ -115,7 +115,7 @@ class TunnelDaemon:
 
     @property
     def _package_dir(self) -> str:
-        """Absolute path of this package's directory (``...\\rpcli``)."""
+        """Absolute path of this package's directory (``...\\ponte``)."""
         return os.path.dirname(os.path.abspath(__file__))
 
     @property
@@ -209,11 +209,11 @@ class TunnelDaemon:
         the daemon exit code (``0`` for a clean, requested stop).
         """
         self._setup_logging()
-        log = logging.getLogger("rpcli.daemon")
+        log = logging.getLogger("ponte.daemon")
 
-        import rpcli
+        import ponte
         log.info(
-            "rpcli v%s daemon starting (pid %d)", rpcli.__version__, os.getpid()
+            "ponte v%s daemon starting (pid %d)", ponte.__version__, os.getpid()
         )
         self.write_pid()
         self._safe_remove(self.stop_marker)
@@ -246,7 +246,7 @@ class TunnelDaemon:
             target=self._watch_stop_marker,
             args=(request_stop,),
             daemon=True,
-            name="rpcli-stop-watch",
+            name="ponte-stop-watch",
         ).start()
 
         # Health checks run once immediately, then every check_interval.
@@ -313,7 +313,7 @@ class TunnelDaemon:
             | subprocess.CREATE_NEW_PROCESS_GROUP
             | subprocess.CREATE_NO_WINDOW
         )
-        cmd = [sys.executable, "-m", "rpcli.main", "start", "--foreground"]
+        cmd = [sys.executable, "-m", "ponte.main", "start", "--foreground"]
         subprocess.Popen(
             cmd,
             cwd=self._root_dir,
@@ -420,7 +420,7 @@ class TunnelDaemon:
     def install_scheduled_task(self) -> str:
         """Register a boot-time Scheduled Task with OS-level auto-restart.
 
-        The task runs ``pythonw -m rpcli.main start --foreground`` in the
+        The task runs ``pythonw -m ponte.main start --foreground`` in the
         project root as SYSTEM. ``RestartCount`` (999, every minute) covers
         machine-level restarts on top of the in-process retry loop.
         """
@@ -431,7 +431,7 @@ class TunnelDaemon:
         script = f"""
 $action = New-ScheduledTaskAction \\
     -Execute '{exe}' \\
-    -Argument '-m rpcli.main start --foreground' \\
+    -Argument '-m ponte.main start --foreground' \\
     -WorkingDirectory '{self._root_dir}'
 $trigger = New-ScheduledTaskTrigger -AtStartup
 $settings = New-ScheduledTaskSettingsSet \\
@@ -498,8 +498,8 @@ Write-Output 'installed'
 
     def _setup_logging(self) -> None:
         """Configure rotating file logging. Idempotent."""
-        root = logging.getLogger("rpcli")
-        if getattr(root, "_rpcli_setup_ok", False):
+        root = logging.getLogger("ponte")
+        if getattr(root, "_ponte_setup_ok", False):
             return
         root.setLevel(logging.INFO)
         max_bytes = self.config.daemon.log_max_bytes
@@ -517,7 +517,7 @@ Write-Output 'installed'
             )
         )
         root.addHandler(handler)
-        root._rpcli_setup_ok = True  # type: ignore[attr-defined]
+        root._ponte_setup_ok = True  # type: ignore[attr-defined]
 
     # -- Cleanup helpers -------------------------------------------------------
 

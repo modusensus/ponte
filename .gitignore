@@ -7,12 +7,12 @@ __pycache__/
 *.pyc
 *.pyo
 
-# rpcli 守护进程运行时文件
-rpcli.pid
-rpcli.status.json
-rpcli.stop
-rpcli.log
-rpcli.log.*
+# ponte 守护进程运行时文件
+ponte.pid
+ponte.status.json
+ponte.stop
+ponte.log
+ponte.log.*
 
 # 开发临时文件
 _scratch.py

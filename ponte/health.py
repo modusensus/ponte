@@ -1,4 +1,4 @@
-"""Health monitoring for the rpcli SSH reverse tunnel manager.
+"""Health monitoring for the ponte SSH reverse tunnel manager.
 
 Independently of the retry layer, this module periodically checks whether the
 underlying SSH process is still alive and whether the remote forwarding ports
@@ -13,8 +13,8 @@ import threading
 import time
 from typing import Callable, Dict, Optional
 
-from rpcli.config import HealthConfig
-from rpcli.core import TunnelManager
+from ponte.config import HealthConfig
+from ponte.core import TunnelManager
 
 __all__ = ["HealthChecker", "HealthStatus"]
 
@@ -200,7 +200,7 @@ class HealthChecker:
                     self.last_callback_error = exc
 
         thread = threading.Thread(
-            target=_loop, name="rpcli-health-check", daemon=True
+            target=_loop, name="ponte-health-check", daemon=True
         )
         thread.start()
         return stop_event
