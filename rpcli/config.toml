@@ -1,0 +1,53 @@
+# SSH Reverse Tunnel CLI Configuration
+# All paths support ~ for home directory expansion
+
+[ssh]
+host = "47.113.179.249"
+port = 22
+user = "root"
+identity_file = "C:\\ssh-tunnel\\id_rsa"
+known_hosts_file = "C:\\ssh-tunnel\\known_hosts"
+
+[ssh.options]
+StrictHostKeyChecking = "accept-new"
+ServerAliveInterval = 30
+ServerAliveCountMax = 3
+ExitOnForwardFailure = "yes"
+TCPKeepAlive = "yes"
+
+# Reverse tunnels: local_port -> remote_port
+# The remote port is opened on the SSH server, forwarding to localhost:local_port
+[[tunnels]]
+remote_port = 23334
+local_host = "localhost"
+local_port = 2222
+description = "WSL SSH via portproxy"
+
+[[tunnels]]
+remote_port = 17897
+local_host = "localhost"
+local_port = 7897
+description = "Windows proxy"
+
+[daemon]
+pid_file = "C:\\ssh-tunnel\\rpcli.pid"
+log_file = "C:\\ssh-tunnel\\rpcli.log"
+log_max_bytes = 10485760   # 10 MB
+log_backup_count = 3
+
+[retry]
+max_retries = 0            # 0 = infinite
+base_delay = 5             # seconds
+max_delay = 300            # 5 minutes
+backoff_factor = 2.0
+jitter = true               # add random jitter to avoid thundering herd
+
+[health]
+check_interval = 60        # seconds
+remote_check_enabled = true
+remote_check_timeout = 10  # seconds
+
+[windows]
+# Scheduled Task configuration
+task_name = "SSH-Reverse-Tunnel"
+ssh_exe = "D:\\Git\\usr\\bin\\ssh.exe"
