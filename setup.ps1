@@ -33,13 +33,13 @@ if ($pubKey) {
 
 # 3. Verify SSH connection
 Write-Host "[3/4] Testing SSH connection..."
-$testResult = & "D:\Git\usr\bin\ssh.exe" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$ScriptDir\known_hosts" -o ConnectTimeout=10 -i "$ScriptDir\id_rsa" root@47.113.179.249 "echo OK" 2>&1
+$testResult = & "D:\Git\usr\bin\ssh.exe" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$ScriptDir\known_hosts" -o ConnectTimeout=10 -i "$ScriptDir\id_rsa" YOUR_USER@YOUR_SERVER_IP "echo OK" 2>&1
 if ($testResult -match "OK") {
     Write-Host "  SSH connection: OK"
 } else {
     Write-Host "  ERROR: SSH connection failed: $testResult"
     Write-Host "  Check: key copied to server? Firewall? Network?"
-    Write-Host "  Run: type C:\ssh-tunnel\id_rsa.pub | ssh root@47.113.179.249 'cat >> ~/.ssh/authorized_keys'"
+    Write-Host "  Run: type C:\ssh-tunnel\id_rsa.pub | ssh YOUR_USER@YOUR_SERVER_IP 'cat >> ~/.ssh/authorized_keys'"
     exit 1
 }
 
