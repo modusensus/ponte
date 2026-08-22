@@ -35,7 +35,7 @@ def _cfg(*, host: str = "example.com", user: str = "testuser", port: int = 22,
 
 
 def test_build_args_full(monkeypatch) -> None:
-    monkeypatch.setattr("ponte.core._find_ssh", lambda: "/usr/bin/ssh")
+    monkeypatch.setattr("ponte.core._find_ssh", lambda _cfg: "/usr/bin/ssh")
     tm = TunnelManager(_cfg())
     args = tm.build_args()
     assert args[0] == "/usr/bin/ssh"
@@ -51,7 +51,7 @@ def test_build_args_full(monkeypatch) -> None:
 
 
 def test_build_args_custom_port(monkeypatch) -> None:
-    monkeypatch.setattr("ponte.core._find_ssh", lambda: "/usr/bin/ssh")
+    monkeypatch.setattr("ponte.core._find_ssh", lambda _cfg: "/usr/bin/ssh")
     tm = TunnelManager(_cfg(port=2222))
     args = tm.build_args()
     assert args[args.index("-p") + 1] == "2222"
@@ -61,7 +61,7 @@ def test_find_ssh_uses_python_ssh(monkeypatch) -> None:
     # PATH 命中 ssh 时用 PATH（非 Windows 分支）
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setattr("ponte.core.shutil.which", lambda _name: "/usr/local/bin/ssh")
-    assert _find_ssh() == "/usr/local/bin/ssh"
+    assert _find_ssh(_cfg()) == "/usr/local/bin/ssh"
 
 
 def test_find_ssh_windows_config(monkeypatch) -> None:
@@ -70,8 +70,7 @@ def test_find_ssh_windows_config(monkeypatch) -> None:
     monkeypatch.setattr("ponte.core.shutil.which", lambda _name: "/not/used")
     monkeypatch.setattr("ponte.core.os.path.isfile", lambda p: p == r"D:\Git\usr\bin\ssh.exe")
     cfg = _cfg(ssh_exe=r"D:\Git\usr\bin\ssh.exe")
-    monkeypatch.setattr("ponte.core.get_config", lambda: cfg)
-    assert _find_ssh() == r"D:\Git\usr\bin\ssh.exe"
+    assert _find_ssh(cfg) == r"D:\Git\usr\bin\ssh.exe"
 
 
 def test_test_connection_ok(monkeypatch) -> None:
