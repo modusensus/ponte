@@ -17,3 +17,6 @@ rpcli.log.*
 # 开发临时文件
 _scratch.py
 _wtest.txt
+# SSH known_hosts（运行时自动写入，不入库）
+known_hosts
+known_hosts.old
