@@ -148,6 +148,16 @@ def test_pythonw_path_falls_back_to_python(monkeypatch, tmp_path) -> None:
     cfg = _cfg(tmp_path)
     d = TunnelDaemon(cfg)
     monkeypatch.setattr(sys, "executable", r"C:\Python\python.exe")
+    # 模拟 Windows 分隔符语义（POSIX 上 os.path.join 用 / 会破坏匹配）：
+    # split 拆出目录，join 用反斜杠拼接，pythonw.exe 存在。
+    monkeypatch.setattr(
+        "ponte.daemon.os.path.split",
+        lambda _p: (r"C:\Python", "python.exe"),
+    )
+    monkeypatch.setattr(
+        "ponte.daemon.os.path.join",
+        lambda *parts: "\\".join(str(p).rstrip("\\/") for p in parts),
+    )
     monkeypatch.setattr(
         "ponte.daemon.os.path.exists",
         lambda p: str(p).lower() == r"c:\python\pythonw.exe",
