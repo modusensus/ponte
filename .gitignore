@@ -1,0 +1,19 @@
+# SSH 私钥与公钥 —— 绝不入库
+id_rsa
+id_rsa.pub
+
+# Python 缓存 / 编译产物
+__pycache__/
+*.pyc
+*.pyo
+
+# rpcli 守护进程运行时文件
+rpcli.pid
+rpcli.status.json
+rpcli.stop
+rpcli.log
+rpcli.log.*
+
+# 开发临时文件
+_scratch.py
+_wtest.txt
