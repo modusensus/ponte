@@ -17,7 +17,7 @@ ExecStart=/usr/bin/autossh -M 0 \
     -o "StrictHostKeyChecking=accept-new" \
     -o "TCPKeepAlive=yes" \
     -N -R 23335:localhost:22 \
-    root@47.113.179.249
+    YOUR_USER@YOUR_SERVER_IP
 Restart=always
 RestartSec=15
 Environment="AUTOSSH_GATETIME=0"

@@ -18,7 +18,7 @@ $PidFile     = "$ScriptDir\tunnel.pid"
 $SshExe       = "D:\Git\usr\bin\ssh.exe"
 $SshKey       = "$ScriptDir\id_rsa"
 $SshKnownHosts = "$ScriptDir\known_hosts"
-$SshServer    = "root@47.113.179.249"
+$SshServer    = "YOUR_USER@YOUR_SERVER_IP"
 $SshOpts      = "-o", "StrictHostKeyChecking=accept-new",
                 "-o", "UserKnownHostsFile=$SshKnownHosts",
                 "-o", "ServerAliveInterval=30",
@@ -54,7 +54,7 @@ function Get-TunnelPid {
     foreach ($p in $procs) {
         try {
             $cmd = (Get-CimInstance Win32_Process -Filter "ProcessId=$($p.Id)").CommandLine
-            if ($cmd -match "23334.*2222.*17897.*7897.*47.113.179.249") {
+            if ($cmd -match "23334.*2222.*17897.*7897") {
                 $p.Id | Out-File -FilePath $PidFile -NoNewline
                 return $p.Id
             }
@@ -176,7 +176,7 @@ function Write-WrapperScript {
         '$sshExe       = "D:\Git\usr\bin\ssh.exe"',
         '$sshKey       = "C:\ssh-tunnel\id_rsa"',
         '$sshKnownHosts = "C:\ssh-tunnel\known_hosts"',
-        '$sshServer    = "root@47.113.179.249"',
+        '$sshServer    = "YOUR_USER@YOUR_SERVER_IP"',
         '$logFile      = "C:\ssh-tunnel\tunnel.log"',
         '',
         '$sshOpts = @(',

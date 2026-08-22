@@ -4,7 +4,7 @@ setlocal
 set SSH_EXE=D:\Git\usr\bin\ssh.exe
 set SSH_KEY=C:\ssh-tunnel\id_rsa
 set SSH_KNOWN_HOSTS=C:\ssh-tunnel\known_hosts
-set SSH_SERVER=root@47.113.179.249
+set SSH_SERVER=YOUR_USER@YOUR_SERVER_IP
 set SSH_OPTS=-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="%SSH_KNOWN_HOSTS%" -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o TCPKeepAlive=yes
 set LOG_FILE=C:\ssh-tunnel\tunnel.log
 
