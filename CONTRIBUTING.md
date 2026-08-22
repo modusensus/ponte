@@ -3,6 +3,8 @@
 Thanks for your interest in ponte. This document covers how to set up a dev
 environment, run tests, and open a clean change.
 
+**Language / 语言：** [English](#english) · [中文](#中文)
+
 ---
 
 # English

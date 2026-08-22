@@ -16,6 +16,9 @@ venv/
 coverage.xml
 htmlcov/
 
+# 可编辑安装产物
+*.egg-info/
+
 # ponte 守护进程运行时文件
 ponte.pid
 ponte.status.json
