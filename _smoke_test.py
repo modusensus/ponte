@@ -52,7 +52,11 @@ class FakeManager:
         self.calls = 0
     def connect(self):
         self.calls += 1
-        while not runner._stop.is_set():
+        # Simulate a tunnel that stays up briefly, then terminates. Looping on
+        # runner._stop alone would deadlock: stop() is only called from the
+        # event driver after connect() returns, so connect must self-return.
+        deadline = time.monotonic() + 0.5
+        while not runner._stop.is_set() and time.monotonic() < deadline:
             time.sleep(0.01)
         return self.connect_result
 
