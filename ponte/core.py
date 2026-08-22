@@ -20,7 +20,7 @@ __all__ = ["TunnelManager"]
 logger = logging.getLogger(__name__)
 
 
-def _find_ssh() -> str:
+def _find_ssh(config: Optional[TunnelConfig] = None) -> str:
     """Return the path to the ``ssh`` executable.
 
     Resolution order:
@@ -30,8 +30,13 @@ def _find_ssh() -> str:
     2. ``ssh`` found on ``PATH`` (Linux/macOS almost always, Git-for-Windows
        often adds it too).
     3. Windows fallbacks to common Git installation paths.
+
+    ``config`` is used to honour the Windows ``ssh_exe`` override. When not
+    provided, the global config is loaded — callers that already hold a
+    validated config (e.g. :class:`TunnelManager`) should pass it to avoid a
+    second, possibly failing, config load.
     """
-    cfg = get_config()
+    cfg = config if config is not None else get_config()
     if sys.platform == "win32" and cfg.windows.ssh_exe:
         exe = cfg.windows.ssh_exe
         if os.path.isfile(exe):
@@ -63,7 +68,7 @@ class TunnelManager:
 
     def __init__(self, config: TunnelConfig) -> None:
         self.config = config
-        self.ssh_exe = _find_ssh()
+        self.ssh_exe = _find_ssh(self.config)
         self.process: Optional[subprocess.Popen] = None
 
     # -- Connection ---------------------------------------------------------
