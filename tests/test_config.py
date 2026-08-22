@@ -7,6 +7,8 @@ import os
 import pytest
 
 from ponte.config import (
+    ConfigNotFoundError,
+    ConfigParseError,
     ConfigValidationError,
     TunnelConfig,
     get_config,
@@ -230,3 +232,132 @@ local_port = 2222
     cfg = load_config(_write_toml(tmp_path, body))
     assert os.path.normpath(cfg.ssh.identity_file) == os.path.normpath(tmp_path / "id_rsa")
     assert os.path.isfile(cfg.ssh.identity_file)
+
+
+def test_config_file_not_found(tmp_path) -> None:
+    with pytest.raises(ConfigNotFoundError):
+        load_config(tmp_path / "missing.toml")
+
+
+def test_config_invalid_toml(tmp_path) -> None:
+    cfg = tmp_path / "bad.toml"
+    cfg.write_text("[ssh\nhost = \"x\"", encoding="utf-8")
+    with pytest.raises(ConfigParseError):
+        load_config(cfg)
+
+
+def test_ssh_section_as_string_rejected(tmp_path) -> None:
+    """When [ssh] is omitted and ssh = "..." is a string, parsing fails."""
+    (tmp_path / "id_rsa").write_text("x", encoding="utf-8")
+    body = f"""
+ssh = "not a table"
+host = "example.com"
+user = "testuser"
+identity_file = "{_toml_str(tmp_path / 'id_rsa')}"
+
+[[tunnels]]
+remote_port = 9999
+local_host = "localhost"
+local_port = 2222
+"""
+    with pytest.raises(ConfigValidationError):
+        load_config(_write_toml(tmp_path, body))
+
+
+def test_port_out_of_range_rejected(tmp_path) -> None:
+    (tmp_path / "id_rsa").write_text("x", encoding="utf-8")
+    body = f"""
+[ssh]
+host = "example.com"
+user = "testuser"
+identity_file = "{_toml_str(tmp_path / 'id_rsa')}"
+port = 99999
+
+[[tunnels]]
+remote_port = 9999
+local_host = "localhost"
+local_port = 2222
+"""
+    with pytest.raises(ConfigValidationError):
+        load_config(_write_toml(tmp_path, body))
+
+
+def test_required_string_empty_rejected(tmp_path) -> None:
+    (tmp_path / "id_rsa").write_text("x", encoding="utf-8")
+    body = """
+[ssh]
+host = ""
+user = "testuser"
+identity_file = "x"
+
+[[tunnels]]
+remote_port = 9999
+local_host = "localhost"
+local_port = 2222
+"""
+    with pytest.raises(ConfigValidationError):
+        load_config(_write_toml(tmp_path, body))
+
+
+def test_optional_string_type_error(tmp_path) -> None:
+    (tmp_path / "id_rsa").write_text("x", encoding="utf-8")
+    body = f"""
+[ssh]
+host = "example.com"
+user = "testuser"
+identity_file = "{_toml_str(tmp_path / 'id_rsa')}"
+known_hosts_file = 123
+
+[[tunnels]]
+remote_port = 9999
+local_host = "localhost"
+local_port = 2222
+"""
+    with pytest.raises(ConfigValidationError):
+        load_config(_write_toml(tmp_path, body))
+
+
+def test_retry_number_validation(tmp_path) -> None:
+    (tmp_path / "id_rsa").write_text("x", encoding="utf-8")
+    body = f"""
+[ssh]
+host = "example.com"
+user = "testuser"
+identity_file = "{_toml_str(tmp_path / 'id_rsa')}"
+
+[[tunnels]]
+remote_port = 9999
+local_host = "localhost"
+local_port = 2222
+
+[retry]
+base_delay = -1
+"""
+    with pytest.raises(ConfigValidationError):
+        load_config(_write_toml(tmp_path, body))
+
+
+def test_health_boolean_validation(tmp_path) -> None:
+    (tmp_path / "id_rsa").write_text("x", encoding="utf-8")
+    body = f"""
+[ssh]
+host = "example.com"
+user = "testuser"
+identity_file = "{_toml_str(tmp_path / 'id_rsa')}"
+
+[[tunnels]]
+remote_port = 9999
+local_host = "localhost"
+local_port = 2222
+
+[health]
+remote_check_enabled = "yes"
+"""
+    with pytest.raises(ConfigValidationError):
+        load_config(_write_toml(tmp_path, body))
+
+
+def test_coerce_unsupported_type() -> None:
+    from ponte.config import _coerce
+    with pytest.raises(ConfigValidationError):
+        _coerce("x", float, "test")

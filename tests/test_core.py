@@ -127,3 +127,86 @@ def test_stop_no_process() -> None:
     tm = TunnelManager(_cfg())
     tm.process = None
     tm.stop()  # 无进程时安全返回
+
+
+def test_find_ssh_windows_fallback(monkeypatch) -> None:
+    # Windows 未配置 ssh_exe、PATH 未命中 → 回退到 Git 路径
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr("ponte.core.shutil.which", lambda _name: None)
+    monkeypatch.setattr(
+        "ponte.core.os.path.isfile",
+        lambda p: p == r"C:\Program Files\Git\usr\bin\ssh.exe",
+    )
+    cfg = _cfg(ssh_exe=None)
+    assert _find_ssh(cfg) == r"C:\Program Files\Git\usr\bin\ssh.exe"
+
+
+def test_find_ssh_windows_config_missing_falls_back(monkeypatch) -> None:
+    # Windows 配置了 ssh_exe 但文件不存在 → 回退 PATH
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr("ponte.core.shutil.which", lambda _name: r"C:\Windows\ssh.exe")
+    monkeypatch.setattr("ponte.core.os.path.isfile", lambda _p: False)
+    cfg = _cfg(ssh_exe=r"D:\missing\ssh.exe")
+    assert _find_ssh(cfg) == r"C:\Windows\ssh.exe"
+
+
+def test_find_ssh_no_config_loads_global(monkeypatch, tmp_path) -> None:
+    # 不传 config 时内部会调用 get_config，这里只验证会落到 PATH
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr("ponte.core.shutil.which", lambda _name: "/usr/bin/ssh")
+    # 避免 get_config 读取真实配置文件失败：直接 monkeypatch 掉
+    monkeypatch.setattr("ponte.core.get_config", lambda: _cfg())
+    assert _find_ssh() == "/usr/bin/ssh"
+
+
+def test_connect_returns_exit_code(monkeypatch) -> None:
+    class _Proc:
+        def __init__(self) -> None:
+            self.returncode = 42
+            self._stderr = b""
+        def communicate(self):
+            return (b"", self._stderr)
+        def poll(self):
+            return self.returncode
+
+    proc = _Proc()
+    monkeypatch.setattr(
+        "ponte.core.subprocess.Popen", lambda *a, **k: proc
+    )
+    tm = TunnelManager(_cfg())
+    assert tm.connect() == 42
+
+
+def test_connect_logs_stderr(monkeypatch, caplog) -> None:
+    class _Proc:
+        def __init__(self) -> None:
+            self.returncode = 1
+        def communicate(self):
+            return (b"", b"auth failed")
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr("ponte.core.subprocess.Popen", lambda *a, **k: _Proc())
+    tm = TunnelManager(_cfg())
+    with caplog.at_level("DEBUG", logger="ponte.core"):
+        tm.connect()
+    assert "auth failed" in caplog.text
+
+
+def test_is_running_reflects_process_state(monkeypatch) -> None:
+    tm = TunnelManager(_cfg())
+    assert tm.is_running() is False
+
+    class _Alive:
+        def poll(self):
+            return None
+
+    tm.process = _Alive()
+    assert tm.is_running() is True
+
+    class _Dead:
+        def poll(self):
+            return 0
+
+    tm.process = _Dead()
+    assert tm.is_running() is False

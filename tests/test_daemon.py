@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 
 from ponte.config import SSHConfig, Tunnel, TunnelConfig
@@ -98,3 +99,114 @@ def test_status_json_parsing(tmp_path) -> None:
     assert s.running is True
     assert s.healthy is True
     assert s.remote_ports == {23334: True}
+
+
+def test_status_malformed_pid_file(tmp_path) -> None:
+    cfg = _cfg(tmp_path)
+    d = TunnelDaemon(cfg)
+    with open(cfg.daemon.pid_file, "w", encoding="utf-8") as fh:
+        fh.write("not-a-number")
+    assert d.read_pid() is None
+
+
+def test_status_malformed_status_json(tmp_path) -> None:
+    cfg = _cfg(tmp_path)
+    d = TunnelDaemon(cfg)
+    with open(cfg.daemon.pid_file, "w", encoding="utf-8") as fh:
+        fh.write(str(os.getpid()))
+    with open(d.status_file, "w", encoding="utf-8") as fh:
+        fh.write("not json")
+    s = d.status()
+    assert s.running is True
+    assert s.healthy is None
+
+
+def test_safe_remove_missing_file(tmp_path) -> None:
+    # 删除不存在的路径不应报错
+    TunnelDaemon._safe_remove(str(tmp_path / "missing"))
+
+
+def test_cleanup_removes_pid_and_marker(tmp_path) -> None:
+    cfg = _cfg(tmp_path)
+    d = TunnelDaemon(cfg)
+    d.write_pid()
+    with open(d.stop_marker, "w", encoding="utf-8") as fh:
+        fh.write("x")
+    d._cleanup()
+    assert not os.path.exists(cfg.daemon.pid_file)
+    assert not os.path.exists(d.stop_marker)
+
+
+def test_pythonw_path_when_executable_is_pythonw(monkeypatch, tmp_path) -> None:
+    cfg = _cfg(tmp_path)
+    d = TunnelDaemon(cfg)
+    monkeypatch.setattr(sys, "executable", r"C:\Python\pythonw.exe")
+    assert d._pythonw_path() == r"C:\Python\pythonw.exe"
+
+
+def test_pythonw_path_falls_back_to_python(monkeypatch, tmp_path) -> None:
+    cfg = _cfg(tmp_path)
+    d = TunnelDaemon(cfg)
+    monkeypatch.setattr(sys, "executable", r"C:\Python\python.exe")
+    monkeypatch.setattr(
+        "ponte.daemon.os.path.exists",
+        lambda p: str(p).lower() == r"c:\python\pythonw.exe",
+    )
+    assert d._pythonw_path() == r"C:\Python\pythonw.exe"
+
+
+def test_setup_logging_idempotent(tmp_path) -> None:
+    cfg = _cfg(tmp_path)
+    d = TunnelDaemon(cfg)
+    d._setup_logging()
+    root = __import__("logging").getLogger("ponte")
+    assert getattr(root, "_ponte_setup_ok", False) is True
+    # 第二次调用不应重复添加 handler
+    before = len(root.handlers)
+    d._setup_logging()
+    assert len(root.handlers) == before
+
+
+def test_on_health_writes_status(tmp_path) -> None:
+    from ponte.health import HealthStatus
+
+    cfg = _cfg(tmp_path)
+    d = TunnelDaemon(cfg)
+    d._on_health(
+        HealthStatus(
+            process_alive=True,
+            remote_ports={23334: True},
+            all_healthy=True,
+            timestamp=time.time(),
+        )
+    )
+    data = d._read_status_json()
+    assert data["process_alive"] is True
+    assert data["healthy"] is True
+    assert data["remote_ports"] == {"23334": True}
+
+
+def test_read_status_json_missing_returns_empty(tmp_path) -> None:
+    cfg = _cfg(tmp_path)
+    d = TunnelDaemon(cfg)
+    assert d._read_status_json() == {}
+
+
+def test_read_status_json_invalid_returns_empty(tmp_path) -> None:
+    cfg = _cfg(tmp_path)
+    d = TunnelDaemon(cfg)
+    os.makedirs(os.path.dirname(d.status_file), exist_ok=True)
+    with open(d.status_file, "w", encoding="utf-8") as fh:
+        fh.write("not json")
+    assert d._read_status_json() == {}
+
+
+def test_write_status_json_failure_silent(tmp_path, monkeypatch) -> None:
+    cfg = _cfg(tmp_path)
+    d = TunnelDaemon(cfg)
+
+    def _bad_open(*_a, **_k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("builtins.open", _bad_open)
+    d._write_status_json({"x": 1})  # 不应抛出

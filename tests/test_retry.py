@@ -140,3 +140,32 @@ def test_jitter_within_bounds() -> None:
     cap = min(5 * 2.0 ** 3, 300)
     assert all(0 <= v < cap for v in vals), (min(vals), max(vals), cap)
     assert any(v > cap * 0.5 for v in vals), "expected spread"
+
+
+def test_retry_event_repr() -> None:
+    assert repr(RetryEvent.connecting()) == "RetryEvent('connecting')"
+    assert "RetryEvent('disconnected'" in repr(RetryEvent.disconnected(1, error="boom"))
+    assert "RetryEvent('retrying'" in repr(RetryEvent.retrying(1.5, 2))
+
+
+def test_retry_event_equality() -> None:
+    a = RetryEvent.connected()
+    b = RetryEvent.connected()
+    assert a == b
+    assert a != RetryEvent.connecting()
+    assert a != "not an event"
+
+
+def test_sleep_interruptibly_zero_or_negative() -> None:
+    runner = RetryRunner(_cfg())
+    runner._sleep_interruptibly(0)
+    runner._sleep_interruptibly(-1)
+    assert not runner.stopped
+
+
+def test_stop_idempotent() -> None:
+    runner = RetryRunner(_cfg())
+    runner.stop()
+    assert runner.stopped
+    runner.stop()
+    assert runner.stopped
