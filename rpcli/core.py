@@ -68,16 +68,14 @@ class TunnelManager:
         )
         try:
             _, stderr = self.process.communicate()
+            returncode: Optional[int] = self.process.returncode
         finally:
             self.process = None
-        rc = self.process.returncode if hasattr(self, "process") else self.process  # type: ignore[assignment]
-        # After communicate() we no longer have a live process reference.
-        # Recover the returncode from the local.
         if stderr:
             stderr_text = stderr.decode("utf-8", errors="replace").strip()
             if stderr_text:
                 logger.debug("SSH stderr: %s", stderr_text)
-        return rc
+        return returncode
 
     def stop(self) -> None:
         """Terminate the running SSH process (if any)."""

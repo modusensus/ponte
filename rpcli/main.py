@@ -24,6 +24,26 @@ from rpcli.config import get_config
 
 __all__ = ["app"]
 
+
+def _configure_utf8_stdio() -> None:
+    """Force UTF-8 on stdio so Chinese output renders in UTF-8 terminals.
+
+    On Windows, Python defaults stdout encoding to the ANSI code page (e.g.
+    GBK on Chinese systems), which garbles Chinese text in UTF-8 terminals
+    such as Windows Terminal, mintty and VS Code.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
+
+
+_configure_utf8_stdio()
+
+
 app = typer.Typer(
     no_args_is_help=True,
     help="管理 SSH 反向隧道守护进程的命令行工具",
