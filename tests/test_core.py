@@ -14,6 +14,12 @@ import pytest
 from ponte.config import SSHConfig, SSHOptions, Tunnel, TunnelConfig, WindowsConfig
 from ponte.core import TunnelManager, _creation_flags, _find_ssh
 
+# ``CREATE_NO_WINDOW`` is a Windows-only constant missing from ``subprocess``
+# on POSIX. Referencing it directly would make the Windows-flag tests fail at
+# import/collection on Linux/macOS, so pin the documented value (0x08000000)
+# and compare against that instead.
+_CREATE_NO_WINDOW_VALUE = 0x08000000
+
 
 def _cfg(*, host: str = "example.com", user: str = "testuser", port: int = 22,
          ssh_exe: str = "/usr/bin/ssh") -> TunnelConfig:
@@ -214,7 +220,7 @@ def test_is_running_reflects_process_state(monkeypatch) -> None:
 
 def test_creation_flags_windows(monkeypatch) -> None:
     monkeypatch.setattr(sys, "platform", "win32")
-    assert _creation_flags() == subprocess.CREATE_NO_WINDOW
+    assert _creation_flags() == _CREATE_NO_WINDOW_VALUE
 
 
 def test_creation_flags_posix(monkeypatch) -> None:
@@ -241,7 +247,7 @@ def test_connect_passes_creationflags(monkeypatch) -> None:
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setattr("ponte.core.subprocess.Popen", _popen)
     TunnelManager(_cfg()).connect()
-    assert captured["creationflags"] == subprocess.CREATE_NO_WINDOW
+    assert captured["creationflags"] == _CREATE_NO_WINDOW_VALUE
 
 
 def test_test_connection_passes_creationflags(monkeypatch) -> None:
@@ -254,4 +260,4 @@ def test_test_connection_passes_creationflags(monkeypatch) -> None:
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setattr("ponte.core.subprocess.run", _run)
     TunnelManager(_cfg()).test_connection()
-    assert captured["creationflags"] == subprocess.CREATE_NO_WINDOW
+    assert captured["creationflags"] == _CREATE_NO_WINDOW_VALUE
