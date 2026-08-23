@@ -12,7 +12,7 @@ import os
 import sys
 import time
 
-from ponte.config import SSHConfig, Tunnel, TunnelConfig
+from ponte.config import SSHConfig, Tunnel, TunnelConfig, WindowsConfig
 from ponte.daemon import (
     DaemonStatus,
     TunnelDaemon,
@@ -23,7 +23,7 @@ from ponte.daemon import (
 )
 
 
-def _cfg(tmp_path) -> TunnelConfig:
+def _cfg(tmp_path, *, run_as: str = "system") -> TunnelConfig:
     return TunnelConfig(
         ssh=SSHConfig(
             host="example.com",
@@ -36,6 +36,7 @@ def _cfg(tmp_path) -> TunnelConfig:
             pid_file=str(tmp_path / "ponte.pid"),
             log_file=str(tmp_path / "ponte.log"),
         ),
+        windows=WindowsConfig(run_as=run_as),
     )
 
 
@@ -163,6 +164,43 @@ def test_pythonw_path_falls_back_to_python(monkeypatch, tmp_path) -> None:
         lambda p: str(p).lower() == r"c:\python\pythonw.exe",
     )
     assert d._pythonw_path() == r"C:\Python\pythonw.exe"
+
+
+def _capture_install_script(monkeypatch, tmp_path, *, run_as: str) -> str:
+    """Mock the PowerShell layer and return the Scheduled-Task script."""
+    cfg = _cfg(tmp_path, run_as=run_as)
+    daemon = TunnelDaemon(cfg)
+    captured: dict[str, str] = {}
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(daemon, "_pythonw_path", lambda: r"C:\Python\pythonw.exe")
+
+    def _run(script: str) -> str:
+        captured["script"] = script
+        return "installed"
+
+    monkeypatch.setattr(daemon, "_run_powershell", _run)
+
+    assert daemon.install_scheduled_task() == "installed"
+    return captured["script"]
+
+
+def test_install_scheduled_task_run_as_system(monkeypatch, tmp_path) -> None:
+    """Default run_as=system keeps a boot-time SYSTEM task (pre-login)."""
+    script = _capture_install_script(monkeypatch, tmp_path, run_as="system")
+    assert "New-ScheduledTaskTrigger -AtStartup" in script
+    assert "-UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest" in script
+    assert "-AtLogOn" not in script
+    assert "Interactive" not in script
+
+
+def test_install_scheduled_task_run_as_user(monkeypatch, tmp_path) -> None:
+    """run_as=user uses a logon task that can read the installing user's keys."""
+    script = _capture_install_script(monkeypatch, tmp_path, run_as="user")
+    assert "$currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name" in script
+    assert "New-ScheduledTaskTrigger -AtLogOn -User $currentUser" in script
+    assert "-UserId $currentUser -LogonType Interactive -RunLevel Limited" in script
+    assert "-UserId 'SYSTEM'" not in script
 
 
 def test_setup_logging_idempotent(tmp_path) -> None:

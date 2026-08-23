@@ -617,22 +617,40 @@ class TunnelDaemon:
     # -- Windows Scheduled Task ------------------------------------------------
 
     def install_scheduled_task(self) -> str:
-        """Register a boot-time Scheduled Task with OS-level auto-restart.
+        """Register a Scheduled Task with OS-level auto-restart.
 
         The task runs ``pythonw -m ponte.main start --foreground`` in the
-        project root as SYSTEM. ``RestartCount`` (999, every minute) covers
-        machine-level restarts on top of the in-process retry loop.
+        project root.  The identity/timing depends on ``[windows] run_as``:
+
+        * ``system`` (default) — boot-time task running as SYSTEM
+          (``ServiceAccount``), so the tunnel is up before login; install
+          requires elevation and the task cannot reach per-user SSH keys.
+        * ``user`` — logon-time task running as the installing user
+          (``Interactive`` + ``Limited``), can read the user's keys and needs
+          no elevation, but runs only after an interactive logon.
+
+        ``RestartCount`` (999, every minute) covers task-level restarts on top
+        of the in-process retry loop.
         """
         if sys.platform != "win32":
             raise RuntimeError("Scheduled Tasks are only supported on Windows")
         exe = self._pythonw_path()
         task_name = self.config.windows.task_name
+        run_as = self.config.windows.run_as
+
+        if run_as == "user":
+            trigger = "$currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name\n$trigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUser"
+            principal = "$principal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Limited"
+        else:
+            trigger = "$trigger = New-ScheduledTaskTrigger -AtStartup"
+            principal = "$principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest"
+
         script = f"""
 $ErrorActionPreference = 'Stop'
 $action = New-ScheduledTaskAction -Execute '{exe}' -Argument '-m ponte.main start --foreground' -WorkingDirectory '{self._root_dir}'
-$trigger = New-ScheduledTaskTrigger -AtStartup
+{trigger}
 $settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-$principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+{principal}
 Register-ScheduledTask -TaskName '{task_name}' -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
 Write-Output 'installed'
 """

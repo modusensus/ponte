@@ -162,10 +162,20 @@ class HealthConfig:
 
 @dataclass(frozen=True)
 class WindowsConfig:
-    """Platform specific knobs used only on Windows."""
+    """Platform specific knobs used only on Windows.
+
+    ``run_as`` selects the Scheduled-Task identity/timing:
+
+    * ``"system"`` (default) — boot-time task running as SYSTEM, surviving
+      login/reboot, but it cannot reach per-user SSH keys (e.g. ``~/.ssh``).
+    * ``"user"`` — logon-time task running as the installing user
+      (``Interactive`` + ``Limited``), so it can read the user's keys and does
+      not require elevation, but only runs after an interactive logon.
+    """
 
     task_name: str = "SSH-Reverse-Tunnel"
     ssh_exe: Optional[str] = None
+    run_as: str = "system"
 
 
 @dataclass(frozen=True)
@@ -409,9 +419,15 @@ def _parse_windows(section: Any) -> WindowsConfig:
     _expect_table(section, "windows")
     task_name = _optional_str(section, "task_name", default="SSH-Reverse-Tunnel")
     ssh_exe = _optional_str(section, "ssh_exe", default=None)
+    run_as = _optional_str(section, "run_as", default="system")
+    if run_as not in ("system", "user"):
+        raise ConfigValidationError(
+            f"Field 'windows.run_as' must be 'system' or 'user', got {run_as!r}"
+        )
     return WindowsConfig(
         task_name=task_name,
         ssh_exe=_expand(ssh_exe) if ssh_exe else None,
+        run_as=run_as or "system",
     )
 
 

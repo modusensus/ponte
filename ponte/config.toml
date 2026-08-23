@@ -63,3 +63,6 @@ kill_timeout = 5           # POSIX 优雅终止等待秒数，超时后 SIGKILL
 # 仅 Windows 使用
 task_name = "SSH-Reverse-Tunnel"
 ssh_exe = "D:\\Git\\usr\\bin\\ssh.exe"
+# run_as = "system"  # 开机即起（默认）：以 SYSTEM 运行，登录前就通，但需提权且读不到用户密钥
+# run_as = "user"    # 登录后起：以当前用户运行，能读 ~/.ssh 密钥、免提权，但不登录不通
+run_as = "system"
