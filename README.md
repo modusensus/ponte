@@ -9,7 +9,7 @@
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue.svg)](#cross-platform-service-management)
 [![CI](https://github.com/modusensus/ponte/actions/workflows/ci.yml/badge.svg)](https://github.com/modusensus/ponte/actions/workflows/ci.yml)
 [![Codecov](https://codecov.io/gh/modusensus/ponte/branch/main/graph/badge.svg)](https://codecov.io/gh/modusensus/ponte)
-[![Tests](https://img.shields.io/badge/tests-89-blue.svg)](tests)
+[![Tests](https://img.shields.io/badge/tests-98-blue.svg)](tests)
 
 **Language / 语言：** [English](#english) · [中文](#中文)
 
@@ -29,7 +29,7 @@
   jitter (`max_retries=0` = retry forever), so a drop never becomes a dead
   tunnel.
 - 🛟 **Crash recovery** — `install` registers an OS auto-start service:
-  Scheduled Task (Windows), systemd user unit (Linux), launchd agent (macOS).
+  boot-or-logon Scheduled Task (Windows), systemd user unit (Linux), launchd agent (macOS).
 - 💚 **Health checks** — periodic local-process + remote-port probing, with
   clear diagnostics instead of a black box.
 - 🖥️ **Cross-platform** — resolves `ssh` automatically, per-platform runtime
@@ -63,7 +63,7 @@ ponte install           # register auto-start + crash restart
 
 | Platform | Mechanism | Generated artifact |
 |----------|-----------|--------------------|
-| Windows | Scheduled Task | `Register-ScheduledTask` (`pythonw -m ponte.main start --foreground`) |
+| Windows | Scheduled Task (boot or logon) | `Register-ScheduledTask` (`pythonw -m ponte.main start --foreground`) |
 | Linux | systemd **user** unit | `~/.config/systemd/user/ponte.service` |
 | macOS | launchd LaunchAgent | `~/Library/LaunchAgents/com.modusensus.ponte.plist` |
 
@@ -98,7 +98,9 @@ Edit `ponte/config.toml` (all paths support `~` expansion):
 - `[retry]` — `max_retries` (0 = forever), backoff params, jitter
 - `[health]` — check interval, remote probe toggle/timeout
 - `[service]` — service name, autostart, POSIX kill grace
-- `[windows]` — Windows-only knobs (`task_name`, `ssh_exe`)
+- `[windows]` — Windows-only knobs (`task_name`, `ssh_exe`, `run_as`).
+  `run_as` is `system` (boot-time, needs elevation, up before login) or
+  `user` (logon-time, reads your SSH keys, no elevation).
 
 ## 🔍 Troubleshooting
 
@@ -141,7 +143,7 @@ CI runs across Windows/Linux/macOS × Python 3.11/3.12 and reports coverage to
 
 - 🔁 **自愈** — 无限重连 + 指数退避 + 全抖动（`max_retries=0` = 永远重试），
   掉线不会变成死隧道。
-- 🛟 **崩溃兜底** — `install` 注册系统级开机自启服务：Windows 计划任务 /
+- 🛟 **崩溃兜底** — `install` 注册系统级开机自启服务：Windows 计划任务（开机或登录） /
   Linux systemd user / macOS launchd。
 - 💚 **健康检查** — 周期探测本地进程存活 + 远程端口，异常给出明确诊断。
 - 🖥️ **跨平台** — 自动查找 `ssh`、按平台落盘运行时文件、可移植的远程端口探测
@@ -175,7 +177,7 @@ ponte install           # 注册开机自启 + 崩溃重启
 
 | 平台 | 机制 | 生成物 |
 |------|------|--------|
-| Windows | 计划任务 | `Register-ScheduledTask`（`pythonw -m ponte.main start --foreground`） |
+| Windows | 计划任务（开机或登录） | `Register-ScheduledTask`（`pythonw -m ponte.main start --foreground`） |
 | Linux | systemd **user** 单元 | `~/.config/systemd/user/ponte.service` |
 | macOS | launchd LaunchAgent | `~/Library/LaunchAgents/com.modusensus.ponte.plist` |
 
@@ -210,7 +212,9 @@ ponte（本地守护进程，Python）
 - `[retry]` — `max_retries`（0 = 无限）、退避参数、抖动
 - `[health]` — 检查间隔、远程探测开关/超时
 - `[service]` — 服务名、自启、POSIX 强杀等待
-- `[windows]` — 仅 Windows 使用（`task_name`、`ssh_exe`）
+- `[windows]` — 仅 Windows 使用（`task_name`、`ssh_exe`、`run_as`）。
+  `run_as` 为 `system`（开机即起、需提权、登录前就运行）或 `user`
+  （登录后运行、能读你的 SSH 密钥、免提权）。
 
 ## 🔍 排障
 

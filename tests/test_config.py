@@ -211,6 +211,66 @@ kill_timeout = 3
     assert cfg.service.kill_timeout == 3.0
 
 
+def test_windows_run_as_user(tmp_path) -> None:
+    (tmp_path / "id_rsa").write_text("x", encoding="utf-8")
+    (tmp_path / "known_hosts").write_text("", encoding="utf-8")
+    body = f"""
+[ssh]
+host = "example.com"
+user = "testuser"
+identity_file = "{_toml_str(tmp_path / 'id_rsa')}"
+
+[[tunnels]]
+remote_port = 23334
+local_host = "localhost"
+local_port = 2222
+
+[windows]
+run_as = "user"
+"""
+    cfg = load_config(_write_toml(tmp_path, body))
+    assert cfg.windows.run_as == "user"
+
+
+def test_windows_run_as_invalid_rejected(tmp_path) -> None:
+    (tmp_path / "id_rsa").write_text("x", encoding="utf-8")
+    (tmp_path / "known_hosts").write_text("", encoding="utf-8")
+    body = f"""
+[ssh]
+host = "example.com"
+user = "testuser"
+identity_file = "{_toml_str(tmp_path / 'id_rsa')}"
+
+[[tunnels]]
+remote_port = 23334
+local_host = "localhost"
+local_port = 2222
+
+[windows]
+run_as = "root"
+"""
+    with pytest.raises(ConfigValidationError):
+        load_config(_write_toml(tmp_path, body))
+
+
+def test_windows_run_as_default_is_system(tmp_path) -> None:
+    (tmp_path / "id_rsa").write_text("x", encoding="utf-8")
+    (tmp_path / "known_hosts").write_text("", encoding="utf-8")
+    body = f"""
+[ssh]
+host = "example.com"
+user = "testuser"
+identity_file = "{_toml_str(tmp_path / 'id_rsa')}"
+
+[[tunnels]]
+remote_port = 23334
+local_host = "localhost"
+local_port = 2222
+"""
+    cfg = load_config(_write_toml(tmp_path, body))
+    assert cfg.windows.run_as == "system"
+
+
 def test_expand_tilde(tmp_path, monkeypatch) -> None:
     # Windows 用 USERPROFILE，POSIX 用 HOME；两处都设，保证跨平台。
     monkeypatch.setenv("HOME", str(tmp_path))
