@@ -12,7 +12,7 @@ import sys
 import pytest
 
 from ponte.config import SSHConfig, SSHOptions, Tunnel, TunnelConfig, WindowsConfig
-from ponte.core import TunnelManager, _find_ssh
+from ponte.core import TunnelManager, _creation_flags, _find_ssh
 
 
 def _cfg(*, host: str = "example.com", user: str = "testuser", port: int = 22,
@@ -210,3 +210,48 @@ def test_is_running_reflects_process_state(monkeypatch) -> None:
 
     tm.process = _Dead()
     assert tm.is_running() is False
+
+
+def test_creation_flags_windows(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+    assert _creation_flags() == subprocess.CREATE_NO_WINDOW
+
+
+def test_creation_flags_posix(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert _creation_flags() == 0
+
+
+def test_connect_passes_creationflags(monkeypatch) -> None:
+    captured: dict = {}
+
+    class _Proc:
+        returncode = 0
+
+        def communicate(self):
+            return (b"", b"")
+
+        def poll(self):
+            return self.returncode
+
+    def _popen(*args, **kwargs):
+        captured["creationflags"] = kwargs.get("creationflags")
+        return _Proc()
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr("ponte.core.subprocess.Popen", _popen)
+    TunnelManager(_cfg()).connect()
+    assert captured["creationflags"] == subprocess.CREATE_NO_WINDOW
+
+
+def test_test_connection_passes_creationflags(monkeypatch) -> None:
+    captured: dict = {}
+
+    def _run(*args, **kwargs):
+        captured["creationflags"] = kwargs.get("creationflags")
+        return __import__("types").SimpleNamespace(returncode=0, stdout="OK")
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr("ponte.core.subprocess.run", _run)
+    TunnelManager(_cfg()).test_connection()
+    assert captured["creationflags"] == subprocess.CREATE_NO_WINDOW

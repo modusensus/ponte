@@ -20,6 +20,18 @@ __all__ = ["TunnelManager"]
 logger = logging.getLogger(__name__)
 
 
+def _creation_flags() -> int:
+    """Return subprocess creation flags that suppress a console window.
+
+    On Windows an SSH child spawned without ``CREATE_NO_WINDOW`` can pop a
+    black console box (the same class of flicker this tool works hard to
+    avoid). On POSIX the flag is meaningless, so return ``0``.
+    """
+    if sys.platform == "win32":
+        return subprocess.CREATE_NO_WINDOW
+    return 0
+
+
 def _find_ssh(config: Optional[TunnelConfig] = None) -> str:
     """Return the path to the ``ssh`` executable.
 
@@ -90,6 +102,7 @@ class TunnelManager:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
+            creationflags=_creation_flags(),
         )
         try:
             _, stderr = self.process.communicate()
@@ -189,6 +202,7 @@ class TunnelManager:
                 capture_output=True,
                 text=True,
                 timeout=timeout + 5,
+                creationflags=_creation_flags(),
             )
             return result.returncode == 0 and "OK" in result.stdout
         except (subprocess.SubprocessError, OSError) as exc:
@@ -250,6 +264,7 @@ class TunnelManager:
                 capture_output=True,
                 text=True,
                 timeout=timeout + 5,
+                creationflags=_creation_flags(),
             )
         except (subprocess.SubprocessError, OSError) as exc:
             logger.debug("Remote port check failed: %s", exc)
