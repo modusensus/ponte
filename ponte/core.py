@@ -26,9 +26,13 @@ def _creation_flags() -> int:
     On Windows an SSH child spawned without ``CREATE_NO_WINDOW`` can pop a
     black console box (the same class of flicker this tool works hard to
     avoid). On POSIX the flag is meaningless, so return ``0``.
+
+    ``create_no_window`` is resolved via ``getattr`` purely so that tests which
+    monkeypatch ``sys.platform`` to ``"win32"`` on a POSIX host still work —
+    the constant simply does not exist in ``subprocess`` there.
     """
     if sys.platform == "win32":
-        return subprocess.CREATE_NO_WINDOW
+        return getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
     return 0
 
 
