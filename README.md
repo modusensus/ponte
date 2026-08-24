@@ -9,7 +9,7 @@
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue.svg)](#cross-platform-service-management)
 [![CI](https://github.com/modusensus/ponte/actions/workflows/ci.yml/badge.svg)](https://github.com/modusensus/ponte/actions/workflows/ci.yml)
 [![Codecov](https://codecov.io/gh/modusensus/ponte/branch/main/graph/badge.svg)](https://codecov.io/gh/modusensus/ponte)
-[![Tests](https://img.shields.io/badge/tests-98-blue.svg)](tests)
+[![Tests](https://img.shields.io/badge/tests-109-blue.svg)](tests)
 
 **Language / 语言：** [English](#english) · [中文](#中文)
 
@@ -27,11 +27,15 @@
 
 - 🔁 **Self-healing** — infinite reconnect with exponential backoff + full
   jitter (`max_retries=0` = retry forever), so a drop never becomes a dead
-  tunnel.
+  tunnel. A session that stays up ≥ `stable_after` seconds resets the retry
+  budget, so a long-running tunnel is never abandoned after a few flaky drops.
 - 🛟 **Crash recovery** — `install` registers an OS auto-start service:
   boot-or-logon Scheduled Task (Windows), systemd user unit (Linux), launchd agent (macOS).
 - 💚 **Health checks** — periodic local-process + remote-port probing, with
-  clear diagnostics instead of a black box.
+  clear diagnostics instead of a black box. A "zombie" SSH process (alive but
+  ports down) is force-reconnected after 3 consecutive failed checks, and
+  checks back off exponentially during outages so the server's `MaxStartups`
+  is never hammered.
 - 🖥️ **Cross-platform** — resolves `ssh` automatically, per-platform runtime
   paths, and portable remote-port probing (`socket` → `ss`/`lsof`/`netstat`).
 
@@ -108,14 +112,14 @@ Edit `ponte/config.toml` (all paths support `~` expansion):
 |---------|---------------|
 | `Permission denied (publickey)` | public key on server `~/.ssh/authorized_keys`; on Windows strip inherited ACLs (`icacls id_rsa /inheritance:r /grant:r <user>:(R)`) |
 | Connection rejected after key change | delete `known_hosts`, reconnect (`StrictHostKeyChecking=accept-new` default) |
-| Process alive but remote port down | cloud security-group inbound rules; check server with `ss -tlnp` / `lsof -nP -iTCP -sTCP:LISTEN` |
+| Process alive but remote port down | cloud security-group inbound rules; check server with `ss -tlnp` / `lsof -nP -iTCP -sTCP:LISTEN` — the daemon now force-reconnects a "zombie" tunnel after 3 consecutive failed checks |
 | Logs | `ponte logs -n 100 --follow` |
 
 ## 🧪 Development & testing
 
 ```bash
 pip install -e ".[dev]"
-pytest --cov=ponte --cov-report=term-missing   # 40+ tests, threshold in pyproject.toml
+pytest --cov=ponte --cov-report=term-missing   # 109 tests, threshold in pyproject.toml
 python _smoke_test.py                          # zero-dependency quick check
 ```
 
@@ -142,10 +146,13 @@ CI runs across Windows/Linux/macOS × Python 3.11/3.12 and reports coverage to
 ## ✦ 特性
 
 - 🔁 **自愈** — 无限重连 + 指数退避 + 全抖动（`max_retries=0` = 永远重试），
-  掉线不会变成死隧道。
+  掉线不会变成死隧道。会话稳定运行 ≥ `stable_after` 秒后重试预算归零，
+  长跑隧道不会因前期几次抖动被永久放弃。
 - 🛟 **崩溃兜底** — `install` 注册系统级开机自启服务：Windows 计划任务（开机或登录） /
   Linux systemd user / macOS launchd。
 - 💚 **健康检查** — 周期探测本地进程存活 + 远程端口，异常给出明确诊断。
+  SSH 进程假死（活着但端口全掉）时连续 3 次检查失败即强制重连；检查失败
+  指数退避，不会高频新开 SSH 触发服务器 `MaxStartups`。
 - 🖥️ **跨平台** — 自动查找 `ssh`、按平台落盘运行时文件、可移植的远程端口探测
   （`socket` → `ss`/`lsof`/`netstat`）。
 
@@ -222,14 +229,14 @@ ponte（本地守护进程，Python）
 |------|----------|
 | 「Permission denied (publickey)」 | 公钥是否加入服务器 `~/.ssh/authorized_keys`；Windows 下私钥去掉继承 ACL（`icacls id_rsa /inheritance:r /grant:r <用户名>:(R)`） |
 | 换 key 后连接被拒 | 删除 `known_hosts` 重连（默认 `StrictHostKeyChecking=accept-new`） |
-| 进程活着但远程端口不通 | 云安全组入方向规则；服务器上 `ss -tlnp` / `lsof -nP -iTCP -sTCP:LISTEN` 确认监听 |
+| 进程活着但远程端口不通 | 云安全组入方向规则；服务器上 `ss -tlnp` / `lsof -nP -iTCP -sTCP:LISTEN` 确认监听 —— 守护进程已支持假死检测：连续 3 次检查失败自动强制重连 |
 | 排查日志 | `ponte logs -n 100 --follow` |
 
 ## 🧪 开发与测试
 
 ```bash
 pip install -e ".[dev]"
-pytest --cov=ponte --cov-report=term-missing   # 40+ 用例，阈值见 pyproject.toml
+pytest --cov=ponte --cov-report=term-missing   # 109 用例，阈值见 pyproject.toml
 python _smoke_test.py                          # 零依赖快速自检
 ```
 
