@@ -49,6 +49,13 @@ _STOP_POLL_INTERVAL = 0.5
 #: ``GetExitCodeProcess``'s STILL_ACTIVE pseudo exit code.
 _STILL_ACTIVE = 259
 
+#: Consecutive unhealthy checks (with the SSH process still alive) before the
+#: daemon force-reconnects a "zombie" tunnel — an SSH process that is still
+#: running but whose remote forwarding ports have all dropped (network hang,
+#: port-stealing race, …). Without this the retry loop would stay blocked in
+#: ``manager.connect()`` forever, leaving the tunnel down.
+_HEALTH_FAILURE_THRESHOLD = 3
+
 
 def _derive_status_file(pid_file: str) -> str:
     """Derive the JSON status path from a ``.pid`` file path."""
@@ -125,6 +132,10 @@ class TunnelDaemon:
         self.stop_marker = _derive_stop_marker(self.pid_file)
         self._shutdown = threading.Event()
         self._last_health: Optional[HealthStatus] = None
+        # Consecutive unhealthy health checks observed by ``_on_health``. Used
+        # to detect a "zombie" SSH process and force a reconnect (see
+        # ``_HEALTH_FAILURE_THRESHOLD``).
+        self._health_failures = 0
 
     # -- Paths -----------------------------------------------------------------
 
@@ -198,8 +209,24 @@ class TunnelDaemon:
 
     # -- Health callback -------------------------------------------------------
 
-    def _on_health(self, status: HealthStatus) -> None:
-        """Store the latest health snapshot and mirror it to the JSON file."""
+    def _on_health(
+        self, status: HealthStatus, manager: Optional[TunnelManager] = None
+    ) -> None:
+        """Store the latest health snapshot and mirror it to the JSON file.
+
+        Also tracks *consecutive* unhealthy checks. When the SSH process is
+        still alive but health has failed for ``_HEALTH_FAILURE_THRESHOLD``
+        checks in a row, the process is presumed to be a "zombie" (alive, yet
+        its remote forwarding ports have all dropped — e.g. after a network
+        hang or a port-stealing race). In that case ``manager.stop()`` is
+        called to kill the current SSH session, which makes the retry loop's
+        blocking ``connect()`` return so the tunnel is re-established instead
+        of being left down forever.
+
+        ``manager`` may be ``None`` (e.g. in unit tests, or before ``run()``),
+        in which case the forced-reconnect path is skipped — the health data is
+        still persisted and logged as usual.
+        """
         self._last_health = status
         data = self._read_status_json()
         data.update(
@@ -215,6 +242,30 @@ class TunnelDaemon:
         self._write_status_json(data)
         health = logger.warning if not status.all_healthy else logger.debug
         health("health: %s", status)
+
+        # Healthy check: reset the consecutive-failure counter.
+        if status.all_healthy:
+            self._health_failures = 0
+            return
+
+        # Unhealthy check: count it, and if the SSH process is still alive
+        # (i.e. a zombie rather than a cleanly-exited process) force reconnect.
+        self._health_failures += 1
+        if (
+            self._health_failures >= _HEALTH_FAILURE_THRESHOLD
+            and status.process_alive
+            and manager is not None
+        ):
+            logger.warning(
+                "假死，强制重连: %d consecutive unhealthy checks while the "
+                "SSH process is still alive; stopping session so the retry "
+                "loop reconnects",
+                self._health_failures,
+            )
+            manager.stop()
+            # Reset so a persistent zombie re-triggers only after another full
+            # run of consecutive failures (avoids repeating every check).
+            self._health_failures = 0
 
     # -- Foreground loop -------------------------------------------------------
 
@@ -268,7 +319,7 @@ class TunnelDaemon:
         # Health checks run once immediately, then every check_interval.
         health_stop = health.run_loop(
             interval=self.config.health.check_interval,
-            callback=lambda st: self._on_health(st),
+            callback=lambda st: self._on_health(st, manager),
         )
 
         log.info(

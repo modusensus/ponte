@@ -56,6 +56,15 @@ def test_load_minimal(tmp_path) -> None:
     # 缺省 daemon 段 → 平台默认 pid/log 非空
     assert cfg.daemon.pid_file
     assert cfg.daemon.log_file
+    # 缺省 health 段 → max_check_interval 取默认值
+    assert cfg.health.max_check_interval == 300.0
+
+
+def test_health_max_check_interval_default() -> None:
+    """``HealthConfig.max_check_interval`` defaults to 300s (backoff ceiling)."""
+    from ponte.config import HealthConfig
+
+    assert HealthConfig().max_check_interval == 300.0
 
 
 def test_missing_tunnels_rejected(tmp_path) -> None:
