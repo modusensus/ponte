@@ -148,6 +148,10 @@ class RetryRunner:
     * ``max_delay``      — cap on the backoff delay, seconds.
     * ``backoff_factor`` — multiplier applied per retry attempt.
     * ``jitter``         — if true, add random full jitter to each delay.
+    * ``stable_after``   — minimum session duration (seconds) that counts as a
+      healthy connection. When a session runs at least this long, the retry
+      budget is reset to zero, so a tunnel that stays up for hours does not
+      permanently give up because of a few earlier flaky connections.
 
     Backoff for attempt ``n``::
 
@@ -164,6 +168,7 @@ class RetryRunner:
         self.max_delay = config.max_delay
         self.backoff_factor = config.backoff_factor
         self.jitter_enabled = config.jitter
+        self.stable_after = config.stable_after
         self._stop = threading.Event()
         # Last exception raised by TunnelManager.connect(), if any. Useful for
         # diagnostics after the run completes.
@@ -197,6 +202,9 @@ class RetryRunner:
         2. A clean return means a session ran to completion — yield
            ``CONNECTED`` followed by ``DISCONNECTED(exit_code)``. A raise
            means the tunnel never came up — yield ``DISCONNECTED(None, error)``.
+           After a clean return, if ``manager.last_session_duration`` is at
+           least ``stable_after``, the session is considered healthy and the
+           retry budget (``retries_used``) is reset to zero.
         3. Unless :meth:`stop` was requested, compute an exponential-backoff
            delay and yield ``RETRYING(delay, attempt)``, then sleep (actually
            wait -- interruptibly).
@@ -227,6 +235,16 @@ class RetryRunner:
                 # terminated, or exited immediately. Either way a session ran.
                 yield RetryEvent.connected()
                 yield RetryEvent.disconnected(exit_code)
+
+                # A session that stayed up for at least ``stable_after``
+                # seconds is a sign of a healthy tunnel. Reset the retry budget
+                # so a long-running tunnel is not permanently abandoned just
+                # because it had a few flaky connections earlier in the day.
+                # ``getattr`` keeps the runner compatible with manager objects
+                # (e.g. test fakes) that predate last_session_duration.
+                session_duration = getattr(manager, "last_session_duration", None)
+                if session_duration is not None and session_duration >= self.stable_after:
+                    retries_used = 0
 
             if self._stop.is_set():
                 return

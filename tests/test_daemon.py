@@ -21,6 +21,7 @@ from ponte.daemon import (
     _derive_stop_marker,
     _encode_ps,
 )
+from ponte.health import HealthStatus
 
 
 def _cfg(tmp_path, *, run_as: str = "system") -> TunnelConfig:
@@ -258,3 +259,84 @@ def test_write_status_json_failure_silent(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr("builtins.open", _bad_open)
     d._write_status_json({"x": 1})  # 不应抛出
+
+
+class _FakeManager:
+    """A TunnelManager stand-in that only records ``stop()`` calls."""
+
+    def __init__(self) -> None:
+        self.stop_calls = 0
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+
+
+def _unhealthy_status(process_alive: bool = True) -> HealthStatus:
+    return HealthStatus(
+        process_alive=process_alive,
+        remote_ports={23334: False},
+        all_healthy=False,
+        timestamp=time.time(),
+    )
+
+
+def _healthy_status() -> HealthStatus:
+    return HealthStatus(
+        process_alive=True,
+        remote_ports={23334: True},
+        all_healthy=True,
+        timestamp=time.time(),
+    )
+
+
+def test_on_health_forces_reconnect_after_threshold(tmp_path) -> None:
+    """连续 N 次 unhealthy 且进程活着 → manager.stop() 被调用，触发后计数归零。"""
+    cfg = _cfg(tmp_path)
+    d = TunnelDaemon(cfg)
+    manager = _FakeManager()
+
+    # 连续两次假死还不够。
+    d._on_health(_unhealthy_status(), manager)
+    d._on_health(_unhealthy_status(), manager)
+    assert manager.stop_calls == 0
+
+    # 第三次达到阈值 → 强制重连一次。
+    d._on_health(_unhealthy_status(), manager)
+    assert manager.stop_calls == 1
+
+    # 触发后计数归零，需重新累积才能再次触发。
+    d._on_health(_unhealthy_status(), manager)
+    d._on_health(_unhealthy_status(), manager)
+    assert manager.stop_calls == 1
+    d._on_health(_unhealthy_status(), manager)
+    assert manager.stop_calls == 2
+
+
+def test_on_health_resets_failures_on_recovery(tmp_path) -> None:
+    """健康恢复 → 计数归零，不触发 stop。"""
+    cfg = _cfg(tmp_path)
+    d = TunnelDaemon(cfg)
+    manager = _FakeManager()
+
+    d._on_health(_unhealthy_status(), manager)
+    d._on_health(_unhealthy_status(), manager)
+    d._on_health(_healthy_status(), manager)  # 恢复 → 计数归零
+
+    # 恢复后重新累计，两次未达阈值 → 不触发。
+    d._on_health(_unhealthy_status(), manager)
+    d._on_health(_unhealthy_status(), manager)
+    assert manager.stop_calls == 0
+    # 第三次才触发。
+    d._on_health(_unhealthy_status(), manager)
+    assert manager.stop_calls == 1
+
+
+def test_on_health_does_not_force_reconnect_when_process_dead(tmp_path) -> None:
+    """进程已死（非假死）不触发强制重连，交给 retry 的 backoff 处理。"""
+    cfg = _cfg(tmp_path)
+    d = TunnelDaemon(cfg)
+    manager = _FakeManager()
+
+    for _ in range(5):
+        d._on_health(_unhealthy_status(process_alive=False), manager)
+    assert manager.stop_calls == 0

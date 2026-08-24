@@ -3,4 +3,4 @@
 A robust CLI tool for managing persistent SSH reverse tunnels.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"

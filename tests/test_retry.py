@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import threading
 import time
+from typing import Optional
 
 from ponte.config import RetryConfig
 from ponte.retry import RetryEvent, RetryRunner
@@ -81,6 +82,92 @@ class _FailManager:
     def connect(self) -> None:
         self.calls += 1
         return None
+
+
+class _ScriptedManager:
+    """A TunnelManager stand-in with scripted per-call session durations.
+
+    Each :meth:`connect` returns immediately and exposes the matching entry
+    from ``durations`` as ``last_session_duration`` (the last value is reused
+    for calls beyond the end of the list). If ``block_on_call`` is set, that
+    1-based call blocks until the runner is stopped, simulating a tunnel the
+    test keeps alive so the runner can be halted before it exhausts its
+    budget.
+    """
+
+    def __init__(
+        self,
+        runner: RetryRunner,
+        durations: list[float],
+        block_on_call: Optional[int] = None,
+    ) -> None:
+        self._runner = runner
+        self.durations = durations
+        self.block_on_call = block_on_call
+        self.calls = 0
+        self.last_session_duration: Optional[float] = None
+
+    def connect(self) -> int:
+        self.calls += 1
+        if self.block_on_call is not None and self.calls == self.block_on_call:
+            while not self._runner._stop.is_set():
+                time.sleep(0.01)
+        self.last_session_duration = self.durations[
+            min(self.calls - 1, len(self.durations) - 1)
+        ]
+        return 0
+
+
+def test_stable_session_resets_retry_budget() -> None:
+    """A session that ran >= stable_after resets ``retries_used``.
+
+    With max_retries=2, two short-lived sessions put the runner on the verge
+    of giving up. The stable session that follows resets the budget, so the
+    runner retries again (attempt back to 1) instead of yielding
+    MAX_RETRIES_REACHED. Without the reset it would give up immediately after
+    the stable session drops.
+    """
+    runner = RetryRunner(_cfg(max_retries=2, base_delay=0.01, max_delay=0.1))
+    mgr = _ScriptedManager(runner, durations=[5, 5, 70], block_on_call=4)
+    events: list[RetryEvent] = []
+
+    def driver() -> None:
+        for ev in runner.run(mgr):
+            events.append(ev)
+
+    t = threading.Thread(target=driver)
+    t.start()
+    # Let the runner churn through the scripted sessions until it reaches the
+    # blocking 4th connect, then stop it cleanly.
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and mgr.calls < 4:
+        time.sleep(0.01)
+    runner.stop()
+    t.join(timeout=5)
+    assert not t.is_alive(), "driver thread did not finish"
+
+    types = [e.type for e in events]
+    assert RetryEvent.MAX_RETRIES_REACHED not in types, types
+    # The two flaky sessions consume attempts 1 and 2; the stable session
+    # resets the counter, so its retry is attempt 1 again.
+    retrying_attempts = [e.attempt for e in events if e.type == RetryEvent.RETRYING]
+    assert retrying_attempts == [1, 2, 1], retrying_attempts
+
+
+def test_unstable_sessions_do_not_reset_retry_budget() -> None:
+    """Short-lived sessions (< stable_after) never reset the budget.
+
+    With max_retries=2, two short-lived connections exhaust the budget and a
+    third connection attempt yields MAX_RETRIES_REACHED.
+    """
+    runner = RetryRunner(_cfg(max_retries=2, base_delay=0.01, max_delay=0.1))
+    mgr = _ScriptedManager(runner, durations=[5, 5, 5])
+    seq = [(e.type, e.attempt) for e in runner.run(mgr)]
+    types = [t for t, _ in seq]
+    assert types.count(RetryEvent.DISCONNECTED) == 3  # initial + 2 retries
+    assert types.count(RetryEvent.CONNECTED) == 3
+    assert seq[-1][0] == RetryEvent.MAX_RETRIES_REACHED
+    assert [a for t, a in seq if t == RetryEvent.RETRYING] == [1, 2]
 
 
 def test_max_retries_exhaustion() -> None:
