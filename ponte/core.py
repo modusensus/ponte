@@ -11,6 +11,8 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from typing import Optional
 
 from ponte.config import TunnelConfig, get_config
@@ -86,6 +88,10 @@ class TunnelManager:
         self.config = config
         self.ssh_exe = _find_ssh(self.config)
         self.process: Optional[subprocess.Popen] = None
+        # Session-duration bookkeeping, consumed by the retry layer to reset
+        # its reconnect budget once a session has stayed up long enough.
+        self._connected_at: Optional[float] = None
+        self._last_session_duration: Optional[float] = None
 
     # -- Connection ---------------------------------------------------------
 
@@ -106,18 +112,48 @@ class TunnelManager:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
+            # POSIX defaults to closing fds on exec; Windows deliberately keeps
+            # the inherited console handles so CREATE_NO_WINDOW keeps working.
+            close_fds=(sys.platform != "win32"),
             creationflags=_creation_flags(),
         )
+        self._connected_at = time.monotonic()
+        # Drain stderr on a daemon thread: the pipe can never fill up (which
+        # would stall SSH), and disconnect reasons are logged in real time
+        # instead of only after the session ends.
+        threading.Thread(
+            target=self._drain_stderr,
+            name="ponte-ssh-stderr",
+            daemon=True,
+        ).start()
         try:
-            _, stderr = self.process.communicate()
-            returncode: Optional[int] = self.process.returncode
+            try:
+                returncode = self.process.wait()
+            finally:
+                self._last_session_duration = self.uptime
+                self._connected_at = None
+            return returncode
         finally:
             self.process = None
-        if stderr:
-            stderr_text = stderr.decode("utf-8", errors="replace").strip()
-            if stderr_text:
-                logger.debug("SSH stderr: %s", stderr_text)
-        return returncode
+
+    def _drain_stderr(self) -> None:
+        """Read the SSH child's stderr line by line until EOF.
+
+        Runs on a daemon thread for the lifetime of the session. Prevents the
+        ``stderr=PIPE`` buffer from filling up and logs server-side disconnect
+        reasons (e.g. ``Connection to host closed by remote host``) as they
+        happen, so a dropped tunnel is diagnosable even after the fact.
+        """
+        proc = self.process
+        if proc is None or proc.stderr is None:
+            return
+        try:
+            for raw in proc.stderr:
+                line = raw.decode("utf-8", errors="replace").rstrip()
+                if line:
+                    logger.warning("SSH stderr: %s", line)
+        except (ValueError, OSError) as exc:
+            logger.debug("stderr reader stopped: %s", exc)
 
     def stop(self) -> None:
         """Terminate the running SSH process (if any)."""
@@ -136,6 +172,25 @@ class TunnelManager:
         if self.process is None:
             return False
         return self.process.poll() is None
+
+    # -- Session duration ------------------------------------------------------
+
+    @property
+    def uptime(self) -> float:
+        """Seconds the current SSH session has been up (``0.0`` when idle)."""
+        if self._connected_at is None:
+            return 0.0
+        return max(0.0, time.monotonic() - self._connected_at)
+
+    @property
+    def last_session_duration(self) -> Optional[float]:
+        """Duration in seconds of the most recently completed session.
+
+        ``None`` until the first :meth:`connect` finishes. The retry layer
+        uses this to decide whether a session was stable enough to reset its
+        reconnect budget.
+        """
+        return self._last_session_duration
 
     # -- Argument building --------------------------------------------------
 

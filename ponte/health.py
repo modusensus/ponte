@@ -64,6 +64,8 @@ class HealthChecker:
       accepts its own ``interval`` override).
     * ``remote_check_enabled`` — whether remote ports are probed at all.
     * ``remote_check_timeout`` — per-port probe timeout, seconds.
+    * ``max_check_interval``   — ceiling (seconds) on the check interval under
+      exponential backoff (see :meth:`run_loop`).
     """
 
     def __init__(self, manager: TunnelManager, config: HealthConfig) -> None:
@@ -169,6 +171,13 @@ class HealthChecker:
         Returns:
             A :class:`threading.Event` that, when set, stops the loop. The loop
             performs one check immediately, then runs until the event is set.
+
+        Backoff: consecutive *unhealthy* checks grow the interval exponentially
+        (``interval * 2 ** failures``), capped at ``config.max_check_interval``.
+        Every remote-port check opens a new SSH connection, so a prolonged
+        outage must not hammer the server hard enough to trip ``MaxStartups``.
+        The interval returns to the base ``interval`` as soon as a check is
+        healthy again.
         """
         if interval is None:
             interval = self.check_interval
@@ -177,23 +186,45 @@ class HealthChecker:
         if callback is None:
             callback = lambda status: None  # noqa: E731 - intentional no-op
 
+        max_interval = self.config.max_check_interval
         stop_event = threading.Event()
 
         def _loop() -> None:
+            failures = 0
+
+            def _advance(healthy: bool) -> None:
+                """Update the consecutive-failure counter and next wait."""
+                nonlocal failures, wait
+                if healthy:
+                    failures = 0
+                else:
+                    failures += 1
+                wait = self._backoff_interval(interval, failures, max_interval)
+
+            wait = interval
             try:
-                callback(self.check())
-            except Exception as exc:  # noqa: BLE001
-                self.last_callback_error = exc
+                status = self.check()
+            except Exception as exc:  # noqa: BLE001 - check() should not
+                self.last_callback_error = exc  # raise, but be defensive
+                _advance(False)
+            else:
+                _advance(status.all_healthy)
+                try:
+                    callback(status)
+                except Exception as exc:  # noqa: BLE001
+                    self.last_callback_error = exc
 
             while not stop_event.is_set():
                 # wait() returns True if the event was set -> stop.
-                if stop_event.wait(interval):
+                if stop_event.wait(wait):
                     return
                 try:
                     status = self.check()
                 except Exception as exc:  # noqa: BLE001 - check() should not
                     self.last_callback_error = exc  # raise, but be defensive
+                    _advance(False)
                     continue
+                _advance(status.all_healthy)
                 try:
                     callback(status)
                 except Exception as exc:  # noqa: BLE001
@@ -206,6 +237,18 @@ class HealthChecker:
         return stop_event
 
     # -- Internals -------------------------------------------------------------
+
+    @staticmethod
+    def _backoff_interval(
+        base_interval: float, failures: int, max_interval: float
+    ) -> float:
+        """Return the next check interval after *failures* consecutive failures.
+
+        Grows exponentially from ``base_interval`` (``base * 2 ** failures``)
+        and is capped at ``max_interval`` so a long outage never stops probing
+        entirely while never probing the SSH server harder than necessary.
+        """
+        return min(base_interval * (2**failures), max_interval)
 
     def _is_process_alive(self) -> bool:
         """Determines whether the underlying SSH process is still running.

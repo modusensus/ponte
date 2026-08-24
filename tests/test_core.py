@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -169,16 +170,13 @@ def test_connect_returns_exit_code(monkeypatch) -> None:
     class _Proc:
         def __init__(self) -> None:
             self.returncode = 42
-            self._stderr = b""
-        def communicate(self):
-            return (b"", self._stderr)
+            self.stderr = iter(())
+        def wait(self):
+            return self.returncode
         def poll(self):
             return self.returncode
 
-    proc = _Proc()
-    monkeypatch.setattr(
-        "ponte.core.subprocess.Popen", lambda *a, **k: proc
-    )
+    monkeypatch.setattr("ponte.core.subprocess.Popen", lambda *a, **k: _Proc())
     tm = TunnelManager(_cfg())
     assert tm.connect() == 42
 
@@ -187,16 +185,41 @@ def test_connect_logs_stderr(monkeypatch, caplog) -> None:
     class _Proc:
         def __init__(self) -> None:
             self.returncode = 1
-        def communicate(self):
-            return (b"", b"auth failed")
+            self.stderr = iter((b"auth failed\n",))
+        def wait(self):
+            return self.returncode
         def poll(self):
             return self.returncode
 
     monkeypatch.setattr("ponte.core.subprocess.Popen", lambda *a, **k: _Proc())
     tm = TunnelManager(_cfg())
-    with caplog.at_level("DEBUG", logger="ponte.core"):
+    with caplog.at_level("WARNING", logger="ponte.core"):
         tm.connect()
+        time.sleep(0.05)  # give the stderr drain thread a moment to flush
     assert "auth failed" in caplog.text
+
+
+def test_connect_records_last_session_duration(monkeypatch) -> None:
+    class _Proc:
+        def __init__(self) -> None:
+            self.returncode = 0
+            self.stderr = iter(())
+        def wait(self):
+            return self.returncode
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr("ponte.core.subprocess.Popen", lambda *a, **k: _Proc())
+    tm = TunnelManager(_cfg())
+    assert tm.last_session_duration is None
+    tm.connect()
+    assert tm.last_session_duration is not None
+    assert tm.last_session_duration >= 0.0
+
+
+def test_uptime_idle_is_zero() -> None:
+    tm = TunnelManager(_cfg())
+    assert tm.uptime == 0.0
 
 
 def test_is_running_reflects_process_state(monkeypatch) -> None:
@@ -233,9 +256,10 @@ def test_connect_passes_creationflags(monkeypatch) -> None:
 
     class _Proc:
         returncode = 0
+        stderr = iter(())
 
-        def communicate(self):
-            return (b"", b"")
+        def wait(self):
+            return self.returncode
 
         def poll(self):
             return self.returncode
