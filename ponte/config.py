@@ -142,6 +142,12 @@ class RetryConfig:
     """Reconnection backoff policy.
 
     ``max_retries`` of 0 means *retry forever*.
+
+    ``stable_after`` is the minimum session duration (seconds) that marks a
+    connection as healthy. When :class:`~ponte.retry.RetryRunner` observes a
+    session that ran at least this long, it resets its reconnect budget so a
+    long-lived tunnel never permanently gives up after a flurry of earlier
+    failures.
     """
 
     max_retries: int = 0
@@ -149,6 +155,7 @@ class RetryConfig:
     max_delay: float = 300.0
     backoff_factor: float = 2.0
     jitter: bool = True
+    stable_after: float = 60.0
 
 
 @dataclass(frozen=True)
@@ -158,6 +165,14 @@ class HealthConfig:
     check_interval: int = 60
     remote_check_enabled: bool = True
     remote_check_timeout: int = 10
+    max_check_interval: float = 300.0
+    """Ceiling (seconds) on the health-check interval under exponential backoff.
+
+    When a check fails, the next interval grows as
+    ``check_interval * 2 ** consecutive_failures`` but is capped at this value
+    so a prolonged outage never stops probing the SSH server entirely (and
+    never hammers it hard enough to trip ``MaxStartups``).
+    """
 
 
 @dataclass(frozen=True)

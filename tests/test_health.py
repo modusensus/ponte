@@ -90,7 +90,9 @@ def test_remote_check_disabled() -> None:
 
 
 def test_run_loop_stops_cleanly() -> None:
-    hc = HealthChecker(_TM(alive=True, ports="dict"), _hc())
+    # Use a healthy manager: with backoff enabled an unhealthy one would grow
+    # the interval and could starve the ">= 3 checks" assertion below.
+    hc = HealthChecker(_TM(alive=True, ports="list"), _hc())
     seen: list[HealthStatus] = []
     stop = hc.run_loop(interval=0.05, callback=lambda st: seen.append(st))
     assert isinstance(stop, threading.Event)
@@ -145,3 +147,125 @@ def test_check_remote_ports_type_error() -> None:
     s = hc.check()
     assert s.all_healthy is False
     assert "TypeError" in (s.error or "")
+
+
+def test_backoff_interval_formula() -> None:
+    """Pure exponential backoff grows by 2**failures and caps at the max."""
+    assert HealthChecker._backoff_interval(60.0, 0, 300.0) == 60.0
+    assert HealthChecker._backoff_interval(60.0, 1, 300.0) == 120.0
+    assert HealthChecker._backoff_interval(60.0, 2, 300.0) == 240.0
+    assert HealthChecker._backoff_interval(60.0, 3, 300.0) == 300.0  # capped
+    assert HealthChecker._backoff_interval(60.0, 10, 300.0) == 300.0
+
+
+def _wait_for_values(values: list, n: int, timeout: float = 3.0) -> None:
+    """Busy-wait until ``values`` has at least ``n`` entries."""
+    deadline = time.time() + timeout
+    while len(values) < n and time.time() < deadline:
+        time.sleep(0.01)
+    assert len(values) >= n, f"captured only {len(values)} values, need {n}"
+
+
+def _fake_wait_recorder(
+    monkeypatch, waits: list[float], released: threading.Event
+) -> None:
+    """Replace ``Event.wait`` with a recorder that never stops until released.
+
+    The recorder swallows the real sleep (so tests run fast) while capturing
+    the timeout each call is invoked with — which is exactly the next check
+    interval the backoff logic computed.
+    """
+    def fake_wait(self, timeout=None):
+        if timeout is not None:
+            waits.append(timeout)
+        if released.is_set():
+            return True
+        time.sleep(0.001)
+        return False
+
+    monkeypatch.setattr(threading.Event, "wait", fake_wait)
+
+
+def _stop_health_thread() -> None:
+    """Stop + join the ``run_loop`` background thread, if still running."""
+    for t in threading.enumerate():
+        if t.name == "ponte-health-check":
+            t.join(timeout=1)
+
+
+def test_run_loop_backoff_after_failures(monkeypatch) -> None:
+    """Unhealthy checks grow the interval exponentially, then cap at the max."""
+    hc = HealthChecker(
+        _TM(alive=True, ports="dict"),  # one remote port down -> unhealthy
+        HealthConfig(
+            check_interval=1.0,
+            remote_check_enabled=True,
+            remote_check_timeout=1,
+            max_check_interval=8.0,
+        ),
+    )
+    waits: list[float] = []
+    released = threading.Event()
+    _fake_wait_recorder(monkeypatch, waits, released)
+
+    hc.run_loop(interval=1.0)
+    _wait_for_values(waits, 6)
+    released.set()
+    _stop_health_thread()
+
+    # Base interval 1.0: 1 failure -> 2.0, 2 -> 4.0, then capped at 8.0.
+    assert waits[0] == 2.0
+    assert waits[1] == 4.0
+    assert waits[2] == 8.0
+    assert all(w == 8.0 for w in waits[2:])
+
+
+def test_run_loop_backoff_resets_after_recovery(monkeypatch) -> None:
+    """A healthy check resets the counter, dropping the interval back to base."""
+
+    class _FlakyTM:
+        """TunnelManager stand-in whose health follows a scripted pattern."""
+
+        def __init__(self, healthy_flags: list[bool]) -> None:
+            self._proc = _Proc(True)
+            self._flags = list(healthy_flags)
+            self._i = 0
+
+        @property
+        def process(self) -> _Proc:
+            return self._proc
+
+        def check_remote_ports(self, **kw) -> dict[int, bool]:
+            healthy = self._flags[self._i % len(self._flags)]
+            self._i += 1
+            return {23334: healthy}
+
+    tm = _FlakyTM([False, False, False, True, True, False])
+    hc = HealthChecker(
+        tm,
+        HealthConfig(
+            check_interval=1.0,
+            remote_check_enabled=True,
+            remote_check_timeout=1,
+            max_check_interval=8.0,
+        ),
+    )
+    waits: list[float] = []
+    released = threading.Event()
+    _fake_wait_recorder(monkeypatch, waits, released)
+
+    hc.run_loop(interval=1.0)
+    _wait_for_values(waits, 7)
+    released.set()
+    _stop_health_thread()
+
+    # Growing while failing...
+    assert waits[0] == 2.0
+    assert waits[1] == 4.0
+    assert waits[2] == 8.0
+    # ...back to the base interval once healthy...
+    assert waits[3] == 1.0
+    assert waits[4] == 1.0
+    # ...and growing again on new consecutive failures.
+    assert waits[5] == 2.0
+    assert waits[6] == 4.0
