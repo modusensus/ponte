@@ -1,0 +1,53 @@
+name: CodeQL
+
+# main 的 ruleset 里有一条 code_scanning 规则（CodeQL，errors /
+# high_or_higher 为阈值），但仓库此前没有任何 CodeQL 工作流，于是「Waiting for
+# Code Scanning results」永远无法满足，PR 一直处于 BLOCKED。这个工作流就是让
+# 那条规则真正产生结果。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # 每周一 03:00 UTC 复查一次，而不是只在有提交时才扫。
+    - cron: "0 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      # 上传 SARIF 结果必须要有 security-events: write。
+      security-events: write
+      packages: read
+      actions: read
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ["python"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 使用默认查询集（GitHub 模板的默认值）。security-and-quality 会带进质量类
+      # 告警，而 ruleset 的 alerts_threshold 是 errors —— 一条质量告警就会卡住
+      # 后续所有 PR，收益不值这个风险。
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v4
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"
