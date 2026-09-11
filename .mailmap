@@ -1,0 +1,9 @@
+# 统一历史署名为 Modusensus。
+#
+# 同一个人的两个 author name（Modusensus / 时观棋）共用同一邮箱，这里把该邮箱
+# 映射到规范名 Modusensus。生效范围：git log、git shortlog、git blame、
+# git describe 以及 GitHub 的提交列表与 API。
+#
+# 说明：.mailmap 只影响“显示”，不修改已有提交对象，历史哈希保持不变。
+# 格式：<规范名> <规范邮箱> <历史邮箱>
+Modusensus <guanqishi26@gmail.com> <guanqishi26@gmail.com>

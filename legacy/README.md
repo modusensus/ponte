@@ -32,5 +32,5 @@ Use the Python CLI instead:
 
 `fix-wsl-tunnel.sh` also rewrote a **system-wide** unit
 (`/etc/systemd/system/autossh-reverse-tunnel.service`) via `sudo`, with a
-hardcoded `User=` — `ponte` installs a per-user unit instead, which needs no
-elevation.
+`User=` field you had to edit by hand — `ponte` installs a per-user unit
+instead, which needs no elevation.

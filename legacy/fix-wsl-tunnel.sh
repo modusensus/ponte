@@ -13,7 +13,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=shiqing
+User=your_linux_user
 ExecStart=/usr/bin/autossh -M 0 \
     -o "ServerAliveInterval=30" \
     -o "ServerAliveCountMax=3" \
