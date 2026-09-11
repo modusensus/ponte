@@ -16,12 +16,12 @@ import time
 
 from ponte.config import TunnelConfig, get_config
 
-__all__ = ["TunnelManager"]
+__all__ = ["TunnelManager", "creation_flags"]
 
 logger = logging.getLogger(__name__)
 
 
-def _creation_flags() -> int:
+def creation_flags() -> int:
     """Return subprocess creation flags that suppress a console window.
 
     On Windows an SSH child spawned without ``CREATE_NO_WINDOW`` can pop a
@@ -31,6 +31,12 @@ def _creation_flags() -> int:
     ``create_no_window`` is resolved via ``getattr`` purely so that tests which
     monkeypatch ``sys.platform`` to ``"win32"`` on a POSIX host still work —
     the constant simply does not exist in ``subprocess`` there.
+
+    This lives here (rather than as an inline expression at each call site)
+    because ``sys.platform == "win32"`` is only understood by ``mypy`` as a
+    platform guard in an ``if`` *statement*; the same check inside a
+    conditional *expression* is type-checked on both branches and fails on
+    Linux, where the constant is absent from typeshed.
     """
     if sys.platform == "win32":
         return getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
@@ -134,7 +140,7 @@ class TunnelManager:
             # POSIX defaults to closing fds on exec; Windows deliberately keeps
             # the inherited console handles so CREATE_NO_WINDOW keeps working.
             close_fds=(sys.platform != "win32"),
-            creationflags=_creation_flags(),
+            creationflags=creation_flags(),
         )
         self._connected_at = time.monotonic()
         # Drain stderr on a daemon thread: the pipe can never fill up (which
@@ -280,7 +286,7 @@ class TunnelManager:
                 capture_output=True,
                 text=True,
                 timeout=timeout + 5,
-                creationflags=_creation_flags(),
+                creationflags=creation_flags(),
             )
             return result.returncode == 0 and "OK" in result.stdout
         except (subprocess.SubprocessError, OSError) as exc:
@@ -342,7 +348,7 @@ class TunnelManager:
                 capture_output=True,
                 text=True,
                 timeout=timeout + 5,
-                creationflags=_creation_flags(),
+                creationflags=creation_flags(),
             )
         except (subprocess.SubprocessError, OSError) as exc:
             logger.debug("Remote port check failed: %s", exc)

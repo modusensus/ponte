@@ -1,19 +1,29 @@
 version: 2
 
 updates:
-  # Keep typer / rich / pytest / ruff / mypy fresh.
+  # 运行时与开发依赖（typer / rich / pytest / ruff / mypy）。
   - package-ecosystem: pip
     directory: "/"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 3
+    # 本项目是应用而不是库：默认策略会把下界一路抬到最新版（例如
+    # pytest>=8 → >=9.1.1），产生一堆无意义的下界提升 PR。
+    # increase-if-necessary 只在确实需要时才动下界。
+    versioning-strategy: increase-if-necessary
     commit-message:
       prefix: chore
+    groups:
+      dev-dependencies:
+        dependency-type: development
 
-  # Keep the actions in .github/workflows up to date.
+  # CI 里用到的 actions，合并成一个 PR，避免一次刷出四五个。
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
     commit-message:
       prefix: chore
+    groups:
+      actions:
+        patterns: ["*"]
