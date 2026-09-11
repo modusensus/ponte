@@ -36,7 +36,7 @@ from collections.abc import Callable
 from xml.sax.saxutils import escape as xml_escape
 
 from ponte.config import TunnelConfig, get_config
-from ponte.core import TunnelManager
+from ponte.core import TunnelManager, creation_flags
 from ponte.health import HealthChecker, HealthStatus
 from ponte.retry import RetryEvent, RetryRunner
 
@@ -787,9 +787,11 @@ Write-Output 'installed'
             "-ExecutionPolicy", "Bypass",
             "-EncodedCommand", _encode_ps(script),
         ]
-        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         result = subprocess.run(
-            cmd, capture_output=True, timeout=timeout, creationflags=flags
+            cmd,
+            capture_output=True,
+            timeout=timeout,
+            creationflags=creation_flags(),
         )
         # PowerShell writes ANSI/GBK on Chinese systems; decode defensively so a
         # garbled line never masks the real exit code / stderr below.

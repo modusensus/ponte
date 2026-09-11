@@ -51,14 +51,19 @@ class _FakeDaemon:
 
 
 def test_help(monkeypatch) -> None:
+    """所有子命令都要出现在 help 里。
+
+    这里刻意不断言全局选项的字面文本：help 由 Rich 渲染，面板列宽与换行会随
+    typer / rich 版本和终端宽度变化（CI 上 typer 0.27 + rich 15 会把 Options
+    面板的名字列整列压掉，"--version" 就不出现在文本里了，而命令本身可用）。
+    全局选项改由行为断言覆盖：见 test_version_option 与
+    test_global_config_option_pins_path。
+    """
     monkeypatch.setattr("ponte.main.get_config", lambda: _cfg())
     result = CliRunner().invoke(app, ["--help"])
     assert result.exit_code == 0
     for cmd in ("start", "stop", "status", "install", "uninstall", "config", "init"):
         assert cmd in result.output
-    # 全局选项应出现在帮助里
-    assert "--version" in result.output
-    assert "--config" in result.output
 
 
 def test_version_option() -> None:

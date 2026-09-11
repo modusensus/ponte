@@ -11,7 +11,7 @@ import sys
 import time
 
 from ponte.config import SSHConfig, SSHOptions, Tunnel, TunnelConfig, WindowsConfig
-from ponte.core import TunnelManager, _creation_flags, _find_ssh
+from ponte.core import TunnelManager, _find_ssh, creation_flags
 
 # ``CREATE_NO_WINDOW`` is a Windows-only constant missing from ``subprocess``
 # on POSIX. Referencing it directly would make the Windows-flag tests fail at
@@ -241,12 +241,12 @@ def test_is_running_reflects_process_state(monkeypatch) -> None:
 
 def test_creation_flags_windows(monkeypatch) -> None:
     monkeypatch.setattr(sys, "platform", "win32")
-    assert _creation_flags() == _CREATE_NO_WINDOW_VALUE
+    assert creation_flags() == _CREATE_NO_WINDOW_VALUE
 
 
 def test_creation_flags_posix(monkeypatch) -> None:
     monkeypatch.setattr(sys, "platform", "linux")
-    assert _creation_flags() == 0
+    assert creation_flags() == 0
 
 
 def test_connect_passes_creationflags(monkeypatch) -> None:

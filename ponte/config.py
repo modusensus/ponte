@@ -1,8 +1,11 @@
 """Configuration loading and validation for the ponte SSH reverse tunnel tool.
 
-Loads ``config.toml`` using :mod:`tomllib` (Python 3.11+) with a fallback to
-the third-party ``tomli`` package on older interpreters, and exposes validated
-dataclasses through a process-wide cached accessor, :func:`get_config`.
+Loads ``config.toml`` using :mod:`tomllib` and exposes validated dataclasses
+through a process-wide cached accessor, :func:`get_config`.
+
+``tomllib`` is used unconditionally: it is stdlib, and Python 3.11 is this
+project's floor (see ``requires-python``), so the old ``tomli`` fallback was
+dead code that only served to break ``mypy --platform linux``.
 
 The configuration file lives *outside* the package so that ``pip install -U``
 never overwrites it. Resolution order (first existing file wins):
@@ -24,14 +27,10 @@ import logging
 import os
 import shutil
 import sys
+import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, overload
-
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
-    import tomli as tomllib  # type: ignore[no-redef]
 
 __all__ = [
     "ConfigError",
