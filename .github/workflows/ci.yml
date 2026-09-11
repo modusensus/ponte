@@ -6,6 +6,30 @@ on:
   pull_request:
 
 jobs:
+  lint:
+    name: Lint & types
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install project with dev deps
+        run: python -m pip install --upgrade pip && pip install -e ".[dev]"
+
+      - name: Ruff
+        run: ruff check --output-format=github .
+
+      - name: Mypy
+        run: mypy
+
+      - name: Smoke test (zero-dependency check)
+        run: python _smoke_test.py
+
   test:
     name: Python ${{ matrix.python-version }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -35,3 +59,58 @@ jobs:
           file: coverage.xml
           flags: ${{ matrix.os }}-py${{ matrix.python-version }}
           fail_ci_if_error: false
+
+  build:
+    name: Build & verify wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist + wheel
+        run: python -m pip install --upgrade build && python -m build
+
+      # `ponte init` copies config.example.toml, so a wheel without it is a
+      # broken install. Guard the packaging regression that shipped once.
+      - name: Assert the example config is inside the wheel
+        run: |
+          python - <<'PY'
+          import glob, sys, zipfile
+
+          wheels = glob.glob("dist/*.whl")
+          assert wheels, "no wheel produced"
+          names = zipfile.ZipFile(wheels[0]).namelist()
+          print("\n".join(names))
+          if "ponte/config.example.toml" not in names:
+              sys.exit("packaging regression: config.example.toml missing from the wheel")
+          PY
+
+      - name: Install the wheel and exercise the CLI
+        run: |
+          python -m pip install dist/*.whl
+          ponte --version
+          # Point HOME at an empty dir so `~/.ssh/id_rsa` cannot exist: the
+          # template must then fail validation deterministically, with an
+          # actionable message instead of a traceback.
+          export HOME="$RUNNER_TEMP/fakehome"
+          mkdir -p "$HOME"
+          # `ponte init` is the documented first step: it must work from a
+          # clean install, which is exactly what was broken before.
+          ponte init --path "$RUNNER_TEMP/ci.toml"
+          test -f "$RUNNER_TEMP/ci.toml"
+          if ponte --config "$RUNNER_TEMP/ci.toml" config 2>err.txt; then
+            echo "::error::placeholder config unexpectedly validated"
+            exit 1
+          fi
+          grep -q "identity file" err.txt || {
+            echo "::error::validation error is not actionable:"; cat err.txt; exit 1
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/

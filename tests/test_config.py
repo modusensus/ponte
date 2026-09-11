@@ -7,6 +7,7 @@ import os
 import pytest
 
 from ponte.config import (
+    ConfigError,
     ConfigNotFoundError,
     ConfigParseError,
     ConfigValidationError,
@@ -262,7 +263,8 @@ run_as = "root"
         load_config(_write_toml(tmp_path, body))
 
 
-def test_windows_run_as_default_is_system(tmp_path) -> None:
+def test_windows_run_as_default_is_user(tmp_path) -> None:
+    """默认 run_as=user：SYSTEM 计划任务读不到 ~/.ssh 密钥，不能做默认值。"""
     (tmp_path / "id_rsa").write_text("x", encoding="utf-8")
     (tmp_path / "known_hosts").write_text("", encoding="utf-8")
     body = f"""
@@ -277,7 +279,7 @@ local_host = "localhost"
 local_port = 2222
 """
     cfg = load_config(_write_toml(tmp_path, body))
-    assert cfg.windows.run_as == "system"
+    assert cfg.windows.run_as == "user"
 
 
 def test_expand_tilde(tmp_path, monkeypatch) -> None:
@@ -286,7 +288,7 @@ def test_expand_tilde(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
     (tmp_path / "id_rsa").write_text("x", encoding="utf-8")
     (tmp_path / "known_hosts").write_text("", encoding="utf-8")
-    body = f"""
+    body = """
 [ssh]
 host = "example.com"
 user = "testuser"
@@ -430,3 +432,189 @@ def test_coerce_unsupported_type() -> None:
     from ponte.config import _coerce
     with pytest.raises(ConfigValidationError):
         _coerce("x", float, "test")
+
+
+# ---------------------------------------------------------------------------
+# 文档承诺过的可调项（此前被静默忽略）
+# ---------------------------------------------------------------------------
+
+
+def test_retry_stable_after_parsed(tmp_path) -> None:
+    """``[retry] stable_after`` 必须真的生效，而不是被解析器丢掉。"""
+    (tmp_path / "id_rsa").write_text("x", encoding="utf-8")
+    body = f"""
+[ssh]
+host = "example.com"
+user = "testuser"
+identity_file = "{_toml_str(tmp_path / 'id_rsa')}"
+
+[[tunnels]]
+remote_port = 23334
+local_host = "localhost"
+local_port = 2222
+
+[retry]
+stable_after = 15
+"""
+    cfg = load_config(_write_toml(tmp_path, body))
+    assert cfg.retry.stable_after == 15.0
+
+
+def test_health_max_check_interval_parsed(tmp_path) -> None:
+    """``[health] max_check_interval`` 同上。"""
+    (tmp_path / "id_rsa").write_text("x", encoding="utf-8")
+    body = f"""
+[ssh]
+host = "example.com"
+user = "testuser"
+identity_file = "{_toml_str(tmp_path / 'id_rsa')}"
+
+[[tunnels]]
+remote_port = 23334
+local_host = "localhost"
+local_port = 2222
+
+[health]
+max_check_interval = 45
+"""
+    cfg = load_config(_write_toml(tmp_path, body))
+    assert cfg.health.max_check_interval == 45.0
+
+
+def test_unknown_key_is_reported_not_ignored(tmp_path) -> None:
+    """拼错的键要产生警告，而不是无声无息。"""
+    (tmp_path / "id_rsa").write_text("x", encoding="utf-8")
+    body = f"""
+[ssh]
+host = "example.com"
+user = "testuser"
+identity_file = "{_toml_str(tmp_path / 'id_rsa')}"
+
+[[tunnels]]
+remote_port = 23334
+local_host = "localhost"
+local_port = 2222
+parsel_port = 9999
+
+[retry]
+base_dely = 3
+"""
+    cfg = load_config(_write_toml(tmp_path, body))
+    joined = " ".join(cfg.warnings)
+    assert "retry.base_dely" in joined
+    assert "tunnels[0].parsel_port" in joined
+    # 未知键只是警告，不应让加载失败
+    assert cfg.retry.base_delay == 5.0
+
+
+def test_ssh_options_extras_are_not_warned(tmp_path) -> None:
+    """``[ssh.options]`` 故意支持任意键，不应产生警告。"""
+    (tmp_path / "id_rsa").write_text("x", encoding="utf-8")
+    body = f"""
+[ssh]
+host = "example.com"
+user = "testuser"
+identity_file = "{_toml_str(tmp_path / 'id_rsa')}"
+
+[ssh.options]
+Compression = "yes"
+
+[[tunnels]]
+remote_port = 23334
+local_host = "localhost"
+local_port = 2222
+"""
+    cfg = load_config(_write_toml(tmp_path, body))
+    assert cfg.warnings == ()
+
+
+# ---------------------------------------------------------------------------
+# 配置文件位置：--config / PONTE_CONFIG / 用户目录 / 包内旧位置
+# ---------------------------------------------------------------------------
+
+
+def test_search_paths_order(monkeypatch, tmp_path) -> None:
+    from ponte.config import config_search_paths, user_config_path
+
+    monkeypatch.setenv("PONTE_CONFIG", str(tmp_path / "env.toml"))
+    explicit = tmp_path / "explicit.toml"
+    paths = config_search_paths(explicit)
+    assert paths[0] == os.path.abspath(explicit)
+    assert paths[1] == os.path.abspath(tmp_path / "env.toml")
+    assert paths[2] == os.path.abspath(user_config_path())
+
+
+def test_set_config_path_overrides_env(monkeypatch, tmp_path) -> None:
+    from ponte.config import config_search_paths, set_config_path
+
+    set_config_path(tmp_path / "pinned.toml")
+    monkeypatch.setenv("PONTE_CONFIG", str(tmp_path / "env.toml"))
+    assert config_search_paths()[0] == os.path.abspath(tmp_path / "pinned.toml")
+    set_config_path(None)
+    assert config_search_paths()[0] == os.path.abspath(tmp_path / "env.toml")
+
+
+def test_get_config_uses_env_var(monkeypatch, tmp_path) -> None:
+    """不传路径时按 PONTE_CONFIG 找到文件。"""
+    target = _minimal(tmp_path)
+    monkeypatch.setenv("PONTE_CONFIG", target)
+    cfg = get_config()
+    assert cfg.source_path == os.path.abspath(target)
+    assert cfg.ssh.host == "example.com"
+
+
+def test_get_config_missing_lists_searched_paths(monkeypatch, tmp_path) -> None:
+    """找不到文件时给出可执行的提示，而不是一句 'not found'。"""
+    monkeypatch.setenv("PONTE_CONFIG", str(tmp_path / "nope.toml"))
+    with pytest.raises(ConfigNotFoundError) as excinfo:
+        get_config()
+    message = str(excinfo.value)
+    assert "ponte init" in message
+    assert "nope.toml" in message
+
+
+def test_init_config_writes_and_refuses_overwrite(monkeypatch, tmp_path) -> None:
+    from ponte.config import init_config
+
+    target = tmp_path / "cfg" / "config.toml"
+    written = init_config(target)
+    assert os.path.isfile(written)
+    # 模板必须能被解析（占位符除外：identity_file 指向不存在的密钥）
+    assert "YOUR_SERVER_IP" in open(written, encoding="utf-8").read()
+
+    with pytest.raises(ConfigError):
+        init_config(target)
+
+    init_config(target, force=True)  # --force 覆盖不报错
+
+
+def test_init_config_prefers_legacy_file(monkeypatch, tmp_path) -> None:
+    """已存在的包内旧配置应被迁移，而不是用占位模板覆盖。"""
+    from ponte import config as config_module
+    from ponte.config import init_config
+
+    legacy = tmp_path / "config.toml"
+    legacy.write_text("# legacy\n", encoding="utf-8")
+    monkeypatch.setattr(config_module, "legacy_config_path", lambda: str(legacy))
+    monkeypatch.setattr(
+        config_module, "example_config_path", lambda: str(tmp_path / "template.toml")
+    )
+
+    target = tmp_path / "out" / "config.toml"
+    init_config(target)
+    assert target.read_text(encoding="utf-8") == "# legacy\n"
+
+
+def test_user_config_path_is_absolute_and_named_config_toml() -> None:
+    from ponte.config import user_config_path
+
+    path = user_config_path()
+    assert os.path.isabs(path)
+    assert os.path.basename(path) == "config.toml"
+
+
+def test_example_config_ships_with_package() -> None:
+    """模板必须真正随包发布（曾经 config.toml 不在 wheel 里）。"""
+    from ponte.config import example_config_path
+
+    assert os.path.isfile(example_config_path())

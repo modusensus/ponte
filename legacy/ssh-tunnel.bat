@@ -1,5 +1,8 @@
 @echo off
 setlocal
+rem DEPRECATED — superseded by `ponte start` (and `ponte install` for autostart).
+rem Fixed 10s restart loop, no backoff/health check; paths are hardcoded.
+rem See ../legacy/README.md.
 
 set SSH_EXE=D:\Git\usr\bin\ssh.exe
 set SSH_KEY=C:\ssh-tunnel\id_rsa

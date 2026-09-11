@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Optional
 
 from ponte.config import RetryConfig
 from ponte.retry import RetryEvent, RetryRunner
@@ -99,13 +98,13 @@ class _ScriptedManager:
         self,
         runner: RetryRunner,
         durations: list[float],
-        block_on_call: Optional[int] = None,
+        block_on_call: int | None = None,
     ) -> None:
         self._runner = runner
         self.durations = durations
         self.block_on_call = block_on_call
         self.calls = 0
-        self.last_session_duration: Optional[float] = None
+        self.last_session_duration: float | None = None
 
     def connect(self) -> int:
         self.calls += 1

@@ -26,27 +26,32 @@ pip install -e ".[dev]"
 ```bash
 pytest                          # full suite (config, core, daemon, health, main, retry)
 pytest --cov=ponte --cov-report=term-missing   # with coverage report
+ruff check .                    # lint (must be clean)
+mypy                            # type check (must be clean)
 python _smoke_test.py           # zero-dependency smoke check
 ```
 
 Coverage has a `fail_under` threshold in `pyproject.toml`; don't let it drop.
-CI runs the same suite on Windows / Linux / macOS × Python 3.11 / 3.12 and
-uploads coverage to Codecov.
+CI runs lint + types on Linux, the same test suite on Windows / Linux / macOS ×
+Python 3.11 / 3.12, and a `build` job that installs the wheel and runs
+`ponte init`. Coverage is uploaded to Codecov.
 
 ## Project layout
 
 ```
 ponte/
-  __init__.py   # version
-  main.py       # typer CLI
-  daemon.py     # lifecycle, service install/uninstall, graceful stop
-  retry.py      # reconnect state machine (backoff + jitter)
-  core.py       # SSH args / subprocess / port probing
-  health.py     # periodic checks
-  config.py     # TOML load/validate
-  config.toml   # configuration
-tests/          # pytest suite
-_smoke_test.py  # offline smoke script
+  __init__.py           # version
+  main.py               # typer CLI
+  daemon.py             # lifecycle, service install/uninstall, graceful stop
+  retry.py              # reconnect state machine (backoff + jitter)
+  core.py               # SSH args / subprocess / port probing
+  health.py             # periodic checks
+  config.py             # TOML load/validate + config file resolution
+  config.example.toml   # template shipped for `ponte init`
+tests/                  # pytest suite (+ conftest.py fixtures)
+_smoke_test.py          # offline smoke script
+legacy/                 # deprecated pre-Python scripts (reference only)
+CHANGELOG.md            # notable changes per release
 ```
 
 ## Conventions
@@ -60,7 +65,14 @@ _smoke_test.py  # offline smoke script
   commands. Platform-specific branches go behind `sys.platform` checks, and
   runtime files use the per-platform defaults from `config.py`.
 - **No secrets in the repo**: never commit keys, tokens, `.env`, or real
-  server addresses. `config.toml` ships with placeholders on purpose.
+  server addresses. `config.example.toml` ships with placeholders on purpose,
+  and the real config lives outside the repository.
+- **Config handling**: read configuration through `get_config()` (never by
+  opening a TOML path directly) so `--config` / `$PONTE_CONFIG` keep working.
+  Every new `[section]` key needs a parser entry — a key the parser does not
+  read is silently ignored, which is exactly the bug class fixed in 0.3.0.
+- **Keep lint and types clean**: `ruff check .` and `mypy` must both pass;
+  avoid adding `# noqa` / `# type: ignore` without a reason on the same line.
 
 ## Commit messages
 
@@ -79,9 +91,11 @@ Types: `feat`, `fix`, `docs`, `test`, `refactor`, `chore`.
 ## Before you open a change
 
 1. `pytest` passes locally.
-2. Coverage stays at/above the `fail_under` threshold.
-3. No private keys or real endpoints in the diff.
-4. If behaviour changed on a specific OS, say so in the description.
+2. `ruff check .` and `mypy` are clean.
+3. Coverage stays at/above the `fail_under` threshold.
+4. No private keys or real endpoints in the diff.
+5. If behaviour changed on a specific OS, say so in the description.
+6. Behaviour changes get an entry in [CHANGELOG.md](CHANGELOG.md).
 
 ## Code of conduct
 
@@ -109,27 +123,32 @@ pip install -e ".[dev]"
 ```bash
 pytest                          # 完整测试套件（config/core/daemon/health/main/retry）
 pytest --cov=ponte --cov-report=term-missing   # 带覆盖率报告
+ruff check .                    # 静态检查（必须干净）
+mypy                            # 类型检查（必须干净）
 python _smoke_test.py           # 零依赖冒烟检查
 ```
 
 覆盖率在 `pyproject.toml` 里有 `fail_under` 阈值，请勿让它回落。CI 会在
-Windows / Linux / macOS × Python 3.11 / 3.12 上跑同一套测试，并把覆盖率
+Linux 上跑 lint + 类型检查，在 Windows / Linux / macOS × Python 3.11 / 3.12
+上跑同一套测试，另有 `build` 任务会安装 wheel 并执行 `ponte init`。覆盖率
 上报到 Codecov。
 
 ## 项目结构
 
 ```
 ponte/
-  __init__.py   # 版本号
-  main.py       # typer CLI
-  daemon.py     # 生命周期、服务安装/卸载、优雅停止
-  retry.py      # 重连状态机（退避 + 抖动）
-  core.py       # SSH 参数 / 子进程 / 端口探测
-  health.py     # 周期检查
-  config.py     # TOML 加载/校验
-  config.toml   # 配置
-tests/          # pytest 测试套件
-_smoke_test.py  # 离线冒烟脚本
+  __init__.py           # 版本号
+  main.py               # typer CLI
+  daemon.py             # 生命周期、服务安装/卸载、优雅停止
+  retry.py              # 重连状态机（退避 + 抖动）
+  core.py               # SSH 参数 / 子进程 / 端口探测
+  health.py             # 周期检查
+  config.py             # TOML 加载/校验 + 配置文件定位
+  config.example.toml   # `ponte init` 使用的模板
+tests/                  # pytest 测试套件（含 conftest.py fixtures）
+_smoke_test.py          # 离线冒烟脚本
+legacy/                 # 已废弃的 PowerShell/批处理脚本（仅存档）
+CHANGELOG.md            # 各版本变更记录
 ```
 
 ## 约定
@@ -141,7 +160,12 @@ _smoke_test.py  # 离线冒烟脚本
 - **跨平台意识**：不要硬编码 Windows 路径或 Linux 专属命令。平台差异走
   `sys.platform` 分支，运行时文件用 `config.py` 里的平台默认路径。
 - **仓库不留密钥**：绝不提交 key、token、`.env` 或真实服务器地址。
-  `config.toml` 里的占位符是有意保留的。
+  `config.example.toml` 里的占位符是有意保留的，真实配置存放在仓库之外。
+- **配置读取统一走 `get_config()`**（不要自己打开某个 TOML 路径），
+  否则 `--config` / `$PONTE_CONFIG` 会失效。新增 `[section]` 键必须同时
+  补解析逻辑——解析器不读的键会被静默忽略，这正是 0.3.0 修掉的那类 bug。
+- **保持 lint 与类型干净**：`ruff check .` 和 `mypy` 都必须通过；
+  加 `# noqa` / `# type: ignore` 时请在同一行写明原因。
 
 ## 提交信息
 
@@ -160,9 +184,11 @@ type(scope): short summary
 ## 提交前检查
 
 1. `pytest` 本地通过。
-2. 覆盖率不低于 `fail_under` 阈值。
-3. diff 里没有私钥或真实端点。
-4. 若某个 OS 上行为有变化，请在描述里说明。
+2. `ruff check .` 与 `mypy` 干净。
+3. 覆盖率不低于 `fail_under` 阈值。
+4. diff 里没有私钥或真实端点。
+5. 若某个 OS 上行为有变化，请在描述里说明。
+6. 行为变更请在 [CHANGELOG.md](CHANGELOG.md) 补一条。
 
 ## 行为准则
 

@@ -1,4 +1,8 @@
 #!/bin/bash
+# DEPRECATED — superseded by `ponte install` on the Linux side, which writes a
+# per-user systemd unit (no sudo, no hardcoded User=). This script overwrites a
+# system-wide unit via sudo; keep it only as a reference. See ../legacy/README.md.
+#
 # Fix WSL autossh reverse tunnel - write new service file
 
 cat > /tmp/autossh-reverse-tunnel.service << 'EOF'

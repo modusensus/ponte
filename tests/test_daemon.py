@@ -7,10 +7,14 @@ scheduled-task / systemd / launchd registries.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import sys
 import time
+import types
+
+import pytest
 
 from ponte.config import SSHConfig, Tunnel, TunnelConfig, WindowsConfig
 from ponte.daemon import (
@@ -58,7 +62,7 @@ def test_encode_ps_roundtrip() -> None:
 
 def test_decode_console_utf8_and_gbk() -> None:
     assert _decode_console(b"") == ""
-    assert _decode_console("正常".encode("utf-8")) == "正常"
+    assert _decode_console("正常".encode()) == "正常"
     # GBK 字节在 UTF-8 下非法 → 回退 GBK 解码
     assert _decode_console("已注册".encode("gbk")) == "已注册"
 
@@ -340,3 +344,178 @@ def test_on_health_does_not_force_reconnect_when_process_dead(tmp_path) -> None:
     for _ in range(5):
         d._on_health(_unhealthy_status(process_alive=False), manager)
     assert manager.stop_calls == 0
+
+
+# ---------------------------------------------------------------------------
+# 进程参数 / 工作目录 / 强制终止提示
+# ---------------------------------------------------------------------------
+
+
+def test_daemon_args_pass_config_explicitly(tmp_path) -> None:
+    """服务方式启动时必须带上 --config，否则可能解析到另一份配置。"""
+    cfg = _cfg(tmp_path)
+    cfg = dataclasses.replace(cfg, source_path=str(tmp_path / "config.toml"))
+    args = TunnelDaemon(cfg)._daemon_args()
+    assert args[:2] == ["-m", "ponte.main"]
+    assert "--config" in args
+    assert args[args.index("--config") + 1] == str(tmp_path / "config.toml")
+    assert args[-2:] == ["start", "--foreground"]
+
+
+def test_daemon_args_string_quotes_paths_with_spaces(tmp_path) -> None:
+    cfg = _cfg(tmp_path)
+    cfg = dataclasses.replace(
+        cfg, source_path=str(tmp_path / "my config" / "config.toml")
+    )
+    rendered = TunnelDaemon(cfg)._daemon_args_string()
+    assert '"' in rendered
+    assert rendered.startswith("-m ponte.main")
+
+
+def test_work_dir_is_config_directory_not_package_parent(tmp_path) -> None:
+    cfg = _cfg(tmp_path)
+    cfg = dataclasses.replace(cfg, source_path=str(tmp_path / "config.toml"))
+    assert TunnelDaemon(cfg).work_dir == str(tmp_path)
+
+
+def test_work_dir_falls_back_to_home(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    cfg = _cfg(tmp_path)
+    cfg = dataclasses.replace(cfg, source_path="/definitely/missing/config.toml")
+    assert TunnelDaemon(cfg).work_dir == os.path.expanduser("~")
+
+
+def test_stop_reports_force_kill_in_message(monkeypatch, tmp_path) -> None:
+    """优雅停止失败时必须告诉用户用了强杀（此前提示永远不会出现）。"""
+    cfg = _cfg(tmp_path)
+    d = TunnelDaemon(cfg)
+    d.write_pid()
+    monkeypatch.setattr(d, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(d, "_stop_autostart", lambda: None)
+    monkeypatch.setattr(d, "_force_kill", lambda _pid: None)
+
+    status = d.stop(timeout=0.1)
+    assert status.running is False
+    assert "强制" in status.message
+
+
+def test_stop_graceful_has_no_kill_message(monkeypatch, tmp_path) -> None:
+    cfg = _cfg(tmp_path)
+    d = TunnelDaemon(cfg)
+    d.write_pid()
+    alive = {"n": 0}
+
+    def _pid_alive(_pid: int) -> bool:
+        alive["n"] += 1
+        return alive["n"] == 1  # 第一次（status）活着，之后已退出
+
+    monkeypatch.setattr(d, "_pid_alive", _pid_alive)
+    monkeypatch.setattr(d, "_stop_autostart", lambda: None)
+    status = d.stop(timeout=0.1)
+    assert "强制" not in status.message
+    assert "kill" not in status.message.lower()
+
+
+# ---------------------------------------------------------------------------
+# 服务安装 / 卸载（subprocess 全部 mock，跨平台可跑）
+# ---------------------------------------------------------------------------
+
+
+def _record_run(record: list[list[str]]):
+    def _run(args, **_kwargs):
+        record.append(list(args))
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    return _run
+
+
+def test_install_systemd_writes_unit_with_config(monkeypatch, tmp_path) -> None:
+    cfg = _cfg(tmp_path)
+    cfg = dataclasses.replace(cfg, source_path=str(tmp_path / "config.toml"))
+    d = TunnelDaemon(cfg)
+    home = tmp_path / "home"
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(
+        "ponte.daemon.os.path.expanduser", lambda p: str(home) + p[1:]
+    )
+    record: list[list[str]] = []
+    monkeypatch.setattr("ponte.daemon.subprocess.run", _record_run(record))
+
+    assert d._install_systemd() == "installed"
+
+    unit_path = home / ".config" / "systemd" / "user" / "ponte.service"
+    unit = unit_path.read_text(encoding="utf-8")
+    assert "Restart=always" in unit
+    assert "--config" in unit
+    assert f'WorkingDirectory={tmp_path}' in unit
+    assert ["systemctl", "--user", "enable", "--now", "ponte.service"] in record
+
+
+def test_uninstall_systemd_removes_unit(monkeypatch, tmp_path) -> None:
+    d = TunnelDaemon(_cfg(tmp_path))
+    home = tmp_path / "home"
+    unit_path = home / ".config" / "systemd" / "user" / "ponte.service"
+    unit_path.parent.mkdir(parents=True)
+    unit_path.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(
+        "ponte.daemon.os.path.expanduser", lambda p: str(home) + p[1:]
+    )
+    monkeypatch.setattr("ponte.daemon.subprocess.run", _record_run([]))
+
+    assert d._uninstall_systemd() == "uninstalled"
+    assert not unit_path.exists()
+
+
+def test_install_launchd_escapes_and_removes(monkeypatch, tmp_path) -> None:
+    cfg = _cfg(tmp_path)
+    cfg = dataclasses.replace(cfg, source_path=str(tmp_path / "a&b.toml"))
+    d = TunnelDaemon(cfg)
+    home = tmp_path / "home"
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(
+        "ponte.daemon.os.path.expanduser", lambda p: str(home) + p[1:]
+    )
+    record: list[list[str]] = []
+    monkeypatch.setattr("ponte.daemon.subprocess.run", _record_run(record))
+
+    assert d._install_launchd() == "installed"
+    plist_path = home / "Library" / "LaunchAgents" / "com.modusensus.ponte.plist"
+    plist = plist_path.read_text(encoding="utf-8")
+    assert "KeepAlive" in plist
+    assert "a&amp;b.toml" in plist  # XML 转义，避免畸形 plist
+    loaded = [cmd for cmd in record if cmd[:3] == ["launchctl", "load", "-w"]]
+    assert loaded, record
+    assert os.path.basename(loaded[0][3]) == "com.modusensus.ponte.plist"
+
+    assert d._uninstall_launchd() == "uninstalled"
+    assert not plist_path.exists()
+
+
+def test_spawn_background_returns_child_pid(monkeypatch, tmp_path) -> None:
+    cfg = _cfg(tmp_path)
+    d = TunnelDaemon(cfg)
+
+    class _Popen:
+        def __init__(self, cmd, **_kwargs) -> None:
+            self.cmd = cmd
+
+    def _popen(cmd, **kwargs):
+        proc = _Popen(cmd, **kwargs)
+        # 子进程“启动后”写下 PID
+        d.write_pid()
+        return proc
+
+    monkeypatch.setattr("ponte.daemon.subprocess.Popen", _popen)
+    assert d._spawn_background() == os.getpid()
+
+
+def test_install_service_dispatch_rejects_unknown_platform(monkeypatch, tmp_path) -> None:
+    d = TunnelDaemon(_cfg(tmp_path))
+    monkeypatch.setattr(sys, "platform", "aix")
+
+    with pytest.raises(RuntimeError):
+        d.install_service()
+    with pytest.raises(RuntimeError):
+        d.uninstall_service()

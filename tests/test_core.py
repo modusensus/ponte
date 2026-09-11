@@ -10,8 +10,6 @@ import subprocess
 import sys
 import time
 
-import pytest
-
 from ponte.config import SSHConfig, SSHOptions, Tunnel, TunnelConfig, WindowsConfig
 from ponte.core import TunnelManager, _creation_flags, _find_ssh
 

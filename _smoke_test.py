@@ -1,4 +1,9 @@
-import importlib.util, sys, types, threading, time, dataclasses
+import dataclasses
+import importlib.util
+import sys
+import threading
+import time
+import types
 
 # --- Stub out ponte.config and ponte.core before importing the real modules ---
 pkg = types.ModuleType("ponte"); pkg.__path__ = []
@@ -12,6 +17,9 @@ class _RC:
     max_delay: float
     backoff_factor: float
     jitter: bool
+    # 必须与 ponte.config.RetryConfig 的字段保持同步：漏字段会让脚本在
+    # RetryRunner.__init__ 里直接 AttributeError（曾经就是这样挂掉的）。
+    stable_after: float = 0.0
 pkg2.RetryConfig = _RC
 
 @dataclasses.dataclass
@@ -19,6 +27,7 @@ class _HC:
     check_interval: float
     remote_check_enabled: bool
     remote_check_timeout: float
+    max_check_interval: float = 300.0
 pkg2.HealthConfig = _HC
 
 pkg3 = types.ModuleType("ponte.core")
@@ -178,8 +187,16 @@ s5 = hc5.check()
 assert s5.remote_ports == {} and s5.all_healthy is True, s5
 print("health: remote check disabled OK ->", s5.all_healthy)
 
+# ---- check-interval backoff (pure function, deterministic) ----
+# 健康检查失败会指数退避（上限 max_check_interval），正常时保持基础间隔。
+assert health.HealthChecker._backoff_interval(60, 0, 300) == 60
+assert health.HealthChecker._backoff_interval(60, 1, 300) == 120
+assert health.HealthChecker._backoff_interval(60, 5, 300) == 300, "must be capped"
+print("health: check-interval backoff OK (base 60s, cap 300s)")
+
 # ---- run_loop ----
-hc6 = health.HealthChecker(TM2(alive=True, ports="dict"), _HC(60, True, 10))
+# 用「健康」的假 manager：失败会触发退避，间隔不再是 0.05s，断言会变成时序竞态。
+hc6 = health.HealthChecker(TM2(alive=True, ports="list"), _HC(60, True, 10))
 seen = []
 stop = hc6.run_loop(interval=0.05, callback=lambda st: seen.append(st))
 assert isinstance(stop, threading.Event)

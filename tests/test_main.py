@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import dataclasses
+import os
+
 from typer.testing import CliRunner
 
+from ponte import __version__
 from ponte.config import (
     HealthConfig,
     RetryConfig,
@@ -50,8 +54,17 @@ def test_help(monkeypatch) -> None:
     monkeypatch.setattr("ponte.main.get_config", lambda: _cfg())
     result = CliRunner().invoke(app, ["--help"])
     assert result.exit_code == 0
-    for cmd in ("start", "stop", "status", "install", "uninstall", "config"):
+    for cmd in ("start", "stop", "status", "install", "uninstall", "config", "init"):
         assert cmd in result.output
+    # 全局选项应出现在帮助里
+    assert "--version" in result.output
+    assert "--config" in result.output
+
+
+def test_version_option() -> None:
+    result = CliRunner().invoke(app, ["--version"])
+    assert result.exit_code == 0
+    assert __version__ in result.output
 
 
 def test_config_command(monkeypatch) -> None:
@@ -232,3 +245,82 @@ def test_force_kill_message_detection() -> None:
     from ponte.main import _force_kill_message
     assert "强制" in _force_kill_message(DaemonStatus(running=False, message="已强制 kill"))
     assert _force_kill_message(DaemonStatus(running=False, message="正常停止")) == ""
+
+
+def test_stop_prints_force_kill_notice(monkeypatch) -> None:
+    """daemon.stop() 报告强杀时，CLI 必须把它显示出来。"""
+
+    class _Fake(_FakeDaemonWithActions):
+        def stop(self) -> DaemonStatus:
+            self.stopped = True
+            return DaemonStatus(running=False, message="守护进程未在 20s 内退出，已强制 kill")
+
+    fake = _Fake(running=True)
+    monkeypatch.setattr("ponte.main._daemon", lambda: fake)
+    result = CliRunner().invoke(app, ["stop"])
+    assert result.exit_code == 0
+    assert "强制" in result.output
+
+
+# ---------------------------------------------------------------------------
+# 全局 --config、init、配置告警
+# ---------------------------------------------------------------------------
+
+
+def test_global_config_option_pins_path(monkeypatch, tmp_path) -> None:
+    from ponte import config as config_module
+
+    monkeypatch.setattr("ponte.main.get_config", lambda: _cfg())
+    target = tmp_path / "custom.toml"
+    result = CliRunner().invoke(app, ["--config", str(target), "config"])
+    assert result.exit_code == 0
+    assert config_module.config_search_paths()[0] == os.path.abspath(target)
+
+
+def test_config_command_shows_warnings(monkeypatch) -> None:
+    cfg = dataclasses.replace(
+        _cfg(), warnings=("未知配置项 'retry.base_dely' 已忽略（请检查拼写）",)
+    )
+    monkeypatch.setattr("ponte.main.get_config", lambda: cfg)
+    result = CliRunner().invoke(app, ["config"])
+    assert result.exit_code == 0
+    assert "base_dely" in result.output
+
+
+def test_config_command_shows_tunables(monkeypatch) -> None:
+    monkeypatch.setattr("ponte.main.get_config", lambda: _cfg())
+    result = CliRunner().invoke(app, ["config"])
+    assert "stable_after" in result.output
+    assert "max_check_interval" in result.output
+
+
+def test_init_command_writes_file(tmp_path) -> None:
+    target = tmp_path / "sub" / "config.toml"
+    result = CliRunner().invoke(app, ["init", "--path", str(target)])
+    assert result.exit_code == 0
+    assert target.is_file()
+    assert "已写入配置" in result.output
+
+
+def test_init_command_refuses_existing_file(tmp_path) -> None:
+    target = tmp_path / "config.toml"
+    target.write_text("existing", encoding="utf-8")
+    result = CliRunner().invoke(app, ["init", "--path", str(target)])
+    assert result.exit_code == 1
+    assert target.read_text(encoding="utf-8") == "existing"
+
+
+def test_logs_follow_exits_on_interrupt(monkeypatch, tmp_path) -> None:
+    log = tmp_path / "ponte.log"
+    log.write_text("line1\n", encoding="utf-8")
+    fake = _FakeDaemonWithActions(running=False)
+    fake.log_file = str(log)
+    monkeypatch.setattr("ponte.main._daemon", lambda: fake)
+
+    def _interrupt(_seconds: float) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("ponte.main.time.sleep", _interrupt)
+    result = CliRunner().invoke(app, ["logs", "--follow"])
+    assert result.exit_code == 0
+    assert "已停止跟随" in result.output

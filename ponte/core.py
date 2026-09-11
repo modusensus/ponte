@@ -13,7 +13,6 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Optional
 
 from ponte.config import TunnelConfig, get_config
 
@@ -38,7 +37,30 @@ def _creation_flags() -> int:
     return 0
 
 
-def _find_ssh(config: Optional[TunnelConfig] = None) -> str:
+#: Default Windows ``ssh.exe`` locations, tried when ``ssh`` is not on PATH.
+#: Git for Windows does not always add ``usr\bin`` to PATH, and the Windows
+#: OpenSSH client lives under System32. Only *default* install locations are
+#: listed — an earlier version also hardcoded a per-machine ``D:\Git\...`` path,
+#: which is meaningless on any other computer.
+_WINDOWS_SSH_FALLBACKS = (
+    r"C:\Program Files\Git\usr\bin\ssh.exe",
+    r"C:\Program Files (x86)\Git\usr\bin\ssh.exe",
+    r"C:\Windows\System32\OpenSSH\ssh.exe",
+)
+
+
+def _windows_ssh_fallbacks() -> list[str]:
+    """Return Windows ssh.exe candidates, including a per-user Git install."""
+    candidates = list(_WINDOWS_SSH_FALLBACKS)
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        candidates.append(
+            os.path.join(local, "Programs", "Git", "usr", "bin", "ssh.exe")
+        )
+    return candidates
+
+
+def _find_ssh(config: TunnelConfig | None = None) -> str:
     """Return the path to the ``ssh`` executable.
 
     Resolution order:
@@ -47,7 +69,7 @@ def _find_ssh(config: Optional[TunnelConfig] = None) -> str:
        (``[windows] ssh_exe``); honour it if it exists.
     2. ``ssh`` found on ``PATH`` (Linux/macOS almost always, Git-for-Windows
        often adds it too).
-    3. Windows fallbacks to common Git installation paths.
+    3. Windows fallbacks to common Git / OpenSSH installation paths.
 
     ``config`` is used to honour the Windows ``ssh_exe`` override. When not
     provided, the global config is loaded — callers that already hold a
@@ -66,14 +88,11 @@ def _find_ssh(config: Optional[TunnelConfig] = None) -> str:
         return found
 
     if sys.platform == "win32":
-        for candidate in (
-            r"D:\Git\usr\bin\ssh.exe",
-            r"C:\Program Files\Git\usr\bin\ssh.exe",
-            r"C:\Program Files (x86)\Git\usr\bin\ssh.exe",
-        ):
+        for candidate in _windows_ssh_fallbacks():
             if os.path.isfile(candidate):
                 return candidate
-        logger.warning("ssh not found on PATH or Git fallback; trying 'ssh' verbatim")
+        logger.warning("ssh not found on PATH or common install paths; "
+                       "trying 'ssh' verbatim")
     return "ssh"
 
 
@@ -87,11 +106,11 @@ class TunnelManager:
     def __init__(self, config: TunnelConfig) -> None:
         self.config = config
         self.ssh_exe = _find_ssh(self.config)
-        self.process: Optional[subprocess.Popen] = None
+        self.process: subprocess.Popen | None = None
         # Session-duration bookkeeping, consumed by the retry layer to reset
         # its reconnect budget once a session has stayed up long enough.
-        self._connected_at: Optional[float] = None
-        self._last_session_duration: Optional[float] = None
+        self._connected_at: float | None = None
+        self._last_session_duration: float | None = None
 
     # -- Connection ---------------------------------------------------------
 
@@ -183,7 +202,7 @@ class TunnelManager:
         return max(0.0, time.monotonic() - self._connected_at)
 
     @property
-    def last_session_duration(self) -> Optional[float]:
+    def last_session_duration(self) -> float | None:
         """Duration in seconds of the most recently completed session.
 
         ``None`` until the first :meth:`connect` finishes. The retry layer

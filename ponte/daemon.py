@@ -32,7 +32,8 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Callable, Optional
+from collections.abc import Callable
+from xml.sax.saxutils import escape as xml_escape
 
 from ponte.config import TunnelConfig, get_config
 from ponte.core import TunnelManager
@@ -99,12 +100,12 @@ class DaemonStatus:
     """A snapshot of daemon state for the ``status``/``stop`` commands."""
 
     running: bool
-    pid: Optional[int] = None
-    started_at: Optional[float] = None
+    pid: int | None = None
+    started_at: float | None = None
     uptime_seconds: float = 0.0
-    healthy: Optional[bool] = None
+    healthy: bool | None = None
     remote_ports: dict[int, bool] = dataclasses.field(default_factory=dict)
-    health_error: Optional[str] = None
+    health_error: str | None = None
     message: str = ""
 
     @property
@@ -124,14 +125,14 @@ class TunnelDaemon:
     JSON status file (updated by the health loop) and the stop marker.
     """
 
-    def __init__(self, config: Optional[TunnelConfig] = None) -> None:
+    def __init__(self, config: TunnelConfig | None = None) -> None:
         self.config = config if config is not None else get_config()
         self.pid_file = self.config.daemon.pid_file
         self.log_file = self.config.daemon.log_file
         self.status_file = _derive_status_file(self.pid_file)
         self.stop_marker = _derive_stop_marker(self.pid_file)
         self._shutdown = threading.Event()
-        self._last_health: Optional[HealthStatus] = None
+        self._last_health: HealthStatus | None = None
         # Consecutive unhealthy health checks observed by ``_on_health``. Used
         # to detect a "zombie" SSH process and force a reconnect (see
         # ``_HEALTH_FAILURE_THRESHOLD``).
@@ -140,14 +141,20 @@ class TunnelDaemon:
     # -- Paths -----------------------------------------------------------------
 
     @property
-    def _package_dir(self) -> str:
-        """Absolute path of this package's directory (``...\\ponte``)."""
-        return os.path.dirname(os.path.abspath(__file__))
+    def work_dir(self) -> str:
+        """Directory the spawned daemon / generated service runs in.
 
-    @property
-    def _root_dir(self) -> str:
-        """Parent of the package dir — the ``C:\\ssh-tunnel`` project root."""
-        return os.path.dirname(self._package_dir)
+        The directory holding the active config file, falling back to the
+        user's home. It used to be the package's *parent* directory, which is
+        wrong once the package is installed: ``site-packages`` is not a
+        meaningful working directory and may not even be writable.
+        """
+        source = self.config.source_path
+        if source:
+            directory = os.path.dirname(os.path.abspath(source))
+            if os.path.isdir(directory):
+                return directory
+        return os.path.expanduser("~")
 
     # -- PID helpers -----------------------------------------------------------
 
@@ -156,9 +163,9 @@ class TunnelDaemon:
         with open(self.pid_file, "w", encoding="utf-8") as handle:
             handle.write(str(os.getpid()))
 
-    def read_pid(self) -> Optional[int]:
+    def read_pid(self) -> int | None:
         try:
-            with open(self.pid_file, "r", encoding="utf-8") as handle:
+            with open(self.pid_file, encoding="utf-8") as handle:
                 return int(handle.read().strip())
         except (OSError, ValueError):
             return None
@@ -194,7 +201,7 @@ class TunnelDaemon:
 
     def _read_status_json(self) -> dict:
         try:
-            with open(self.status_file, "r", encoding="utf-8") as handle:
+            with open(self.status_file, encoding="utf-8") as handle:
                 data = json.load(handle)
                 return data if isinstance(data, dict) else {}
         except (OSError, ValueError):
@@ -210,7 +217,7 @@ class TunnelDaemon:
     # -- Health callback -------------------------------------------------------
 
     def _on_health(
-        self, status: HealthStatus, manager: Optional[TunnelManager] = None
+        self, status: HealthStatus, manager: TunnelManager | None = None
     ) -> None:
         """Store the latest health snapshot and mirror it to the JSON file.
 
@@ -331,7 +338,9 @@ class TunnelDaemon:
                 if event.type == RetryEvent.CONNECTING:
                     log.debug("connecting to %s ...", self.config.ssh.destination)
                 elif event.type == RetryEvent.CONNECTED:
-                    log.info("tunnel established")
+                    # Only means "an SSH session started": whether it stays up
+                    # is known after it exits (DISCONNECTED carries the code).
+                    log.info("SSH session started")
                 elif event.type == RetryEvent.DISCONNECTED:
                     log.warning(
                         "tunnel down (exit=%s error=%s)", event.exit_code, event.error
@@ -363,6 +372,26 @@ class TunnelDaemon:
 
     # -- Start / background ----------------------------------------------------
 
+    def _daemon_args(self) -> list[str]:
+        """CLI arguments that re-run this daemon in the foreground.
+
+        The active config file is passed explicitly (``--config``) so a
+        service-managed daemon never resolves a *different* file than the one
+        the user installed it with — the Windows SYSTEM task, for example, has
+        its own ``%APPDATA%`` and would otherwise look in the wrong place.
+        """
+        args = ["-m", "ponte.main"]
+        if self.config.source_path:
+            args.extend(["--config", self.config.source_path])
+        args.extend(["start", "--foreground"])
+        return args
+
+    def _daemon_args_string(self) -> str:
+        """`_daemon_args` rendered for a Windows Scheduled-Task action string."""
+        return " ".join(
+            f'"{arg}"' if " " in arg else arg for arg in self._daemon_args()
+        )
+
     def start(self, foreground: bool = False) -> int:
         """Start the daemon, optionally in the background.
 
@@ -375,7 +404,7 @@ class TunnelDaemon:
 
     def _spawn_background(self) -> int:
         """Re-launch this CLI as a detached background process."""
-        cmd = [sys.executable, "-m", "ponte.main", "start", "--foreground"]
+        cmd = [sys.executable, *self._daemon_args()]
         if sys.platform == "win32":
             flags = (
                 subprocess.DETACHED_PROCESS
@@ -384,7 +413,7 @@ class TunnelDaemon:
             )
             subprocess.Popen(
                 cmd,
-                cwd=self._root_dir,
+                cwd=self.work_dir,
                 creationflags=flags,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
@@ -395,7 +424,7 @@ class TunnelDaemon:
             # controlling terminal and survives the parent shell exiting.
             subprocess.Popen(
                 cmd,
-                cwd=self._root_dir,
+                cwd=self.work_dir,
                 start_new_session=True,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
@@ -417,6 +446,10 @@ class TunnelDaemon:
         Steps: stop the scheduled task (so it does not respawn us), drop the
         stop marker, wait for the PID to vanish, then ``taskkill /T /F`` if the
         daemon ignores the request.
+
+        The returned status carries a ``message`` when the graceful path failed,
+        so the CLI can tell the user a force kill was used instead of silently
+        escalating.
         """
         status = self.status()
         if not status.running or status.pid is None:
@@ -438,15 +471,25 @@ class TunnelDaemon:
             time.sleep(0.2)
 
         # 4. Escalate if still alive.
+        forced = False
         if self._pid_alive(status.pid):
             logger.warning(
                 "daemon did not stop gracefully; force killing pid %d", status.pid
             )
             self._force_kill(status.pid)
+            forced = True
 
         self._safe_remove(self.stop_marker)
         self._safe_remove(self.pid_file)
-        return self.status()
+        final = self.status()
+        if forced:
+            return dataclasses.replace(
+                final,
+                message=(
+                    f"守护进程未在 {timeout:.0f}s 内退出，已强制 kill（含子进程）"
+                ),
+            )
+        return final
 
     def _force_kill(self, pid: int) -> None:
         """Kill *pid* and its whole tree, regardless of platform.
@@ -570,6 +613,7 @@ class TunnelDaemon:
         unit_dir = os.path.expanduser("~/.config/systemd/user")
         os.makedirs(unit_dir, exist_ok=True)
         unit_path = os.path.join(unit_dir, f"{name}.service")
+        exec_args = " ".join(f'"{arg}"' for arg in self._daemon_args())
         unit = (
             "[Unit]\n"
             f"Description=ponte SSH reverse tunnel daemon ({name})\n"
@@ -578,8 +622,8 @@ class TunnelDaemon:
             "\n"
             "[Service]\n"
             "Type=simple\n"
-            f"ExecStart={sys.executable} -m ponte.main start --foreground\n"
-            f"WorkingDirectory={self._root_dir}\n"
+            f'ExecStart="{sys.executable}" {exec_args}\n'
+            f"WorkingDirectory={self.work_dir}\n"
             "Restart=always\n"
             "RestartSec=15\n"
             "Environment=PYTHONUNBUFFERED=1\n"
@@ -622,27 +666,27 @@ class TunnelDaemon:
         plist_path = self._launchd_plist()
         os.makedirs(os.path.dirname(plist_path), exist_ok=True)
         label = f"com.modusensus.{self.config.service.name}"
+        program_args = "\n".join(
+            f"        <string>{xml_escape(arg)}</string>"
+            for arg in [sys.executable, *self._daemon_args()]
+        )
         plist = (
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
             '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
             '<plist version="1.0">\n'
             "<dict>\n"
-            f"    <key>Label</key><string>{label}</string>\n"
+            f"    <key>Label</key><string>{xml_escape(label)}</string>\n"
             "    <key>ProgramArguments</key>\n"
             "    <array>\n"
-            f"        <string>{sys.executable}</string>\n"
-            "        <string>-m</string>\n"
-            "        <string>ponte.main</string>\n"
-            "        <string>start</string>\n"
-            "        <string>--foreground</string>\n"
+            f"{program_args}\n"
             "    </array>\n"
-            f"    <key>WorkingDirectory</key><string>{self._root_dir}</string>\n"
+            f"    <key>WorkingDirectory</key><string>{self.work_dir}</string>\n"
             "    <key>RunAtLoad</key><true/>\n"
             "    <key>KeepAlive</key><true/>\n"
             "    <key>ProcessType</key><string>Background</string>\n"
-            f"    <key>StandardOutPath</key><string>{self.log_file}</string>\n"
-            f"    <key>StandardErrorPath</key><string>{self.log_file}</string>\n"
+            f"    <key>StandardOutPath</key><string>{xml_escape(self.log_file)}</string>\n"
+            f"    <key>StandardErrorPath</key><string>{xml_escape(self.log_file)}</string>\n"
             "</dict>\n"
             "</plist>\n"
         )
@@ -670,15 +714,17 @@ class TunnelDaemon:
     def install_scheduled_task(self) -> str:
         """Register a Scheduled Task with OS-level auto-restart.
 
-        The task runs ``pythonw -m ponte.main start --foreground`` in the
-        project root.  The identity/timing depends on ``[windows] run_as``:
+        The task runs ``pythonw -m ponte.main --config <file> start
+        --foreground`` with the working directory set to
+        :attr:`work_dir`.  The identity/timing depends on ``[windows] run_as``:
 
-        * ``system`` (default) — boot-time task running as SYSTEM
-          (``ServiceAccount``), so the tunnel is up before login; install
-          requires elevation and the task cannot reach per-user SSH keys.
-        * ``user`` — logon-time task running as the installing user
+        * ``user`` (default) — logon-time task running as the installing user
           (``Interactive`` + ``Limited``), can read the user's keys and needs
           no elevation, but runs only after an interactive logon.
+        * ``system`` — boot-time task running as SYSTEM (``ServiceAccount``),
+          so the tunnel is up before login; install requires elevation and the
+          task cannot reach per-user SSH keys, so point ``identity_file`` at a
+          key SYSTEM can read.
 
         ``RestartCount`` (999, every minute) covers task-level restarts on top
         of the in-process retry loop.
@@ -698,7 +744,7 @@ class TunnelDaemon:
 
         script = f"""
 $ErrorActionPreference = 'Stop'
-$action = New-ScheduledTaskAction -Execute '{exe}' -Argument '-m ponte.main start --foreground' -WorkingDirectory '{self._root_dir}'
+$action = New-ScheduledTaskAction -Execute '{exe}' -Argument '{self._daemon_args_string()}' -WorkingDirectory '{self.work_dir}'
 {trigger}
 $settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 {principal}

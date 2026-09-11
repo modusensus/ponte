@@ -19,6 +19,18 @@ htmlcov/
 # 可编辑安装产物
 *.egg-info/
 
+# 工具缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 打包产物
+build/
+dist/
+
+# 本地真实配置：配置已迁出包目录，此处仅为兼容旧位置，绝不入库
+ponte/config.toml
+
 # ponte 守护进程运行时文件
 ponte.pid
 ponte.status.json

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Optional
 
 import pytest
 
@@ -16,7 +15,7 @@ class _Proc:
     def __init__(self, alive: bool) -> None:
         self.alive = alive
 
-    def poll(self) -> Optional[int]:
+    def poll(self) -> int | None:
         return None if self.alive else 1
 
 
@@ -27,7 +26,7 @@ class _TM:
         self._proc = _Proc(alive)
         self.ports = ports
         self.fail_ports = fail_ports
-        self._timeout: Optional[int] = None
+        self._timeout: int | None = None
 
     @property
     def process(self) -> _Proc:

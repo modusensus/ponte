@@ -4,11 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ponte"
-version = "0.2.1"
+dynamic = ["version"]
 description = "Persistent SSH reverse tunnel daemon CLI (Windows / Linux / macOS)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
+authors = [{ name = "modusensus", email = "guanqishi26@gmail.com" }]
 keywords = ["ssh", "reverse-tunnel", "tunnel", "daemon", "cli"]
 classifiers = [
     "Environment :: Console",
@@ -22,21 +23,38 @@ classifiers = [
     "Topic :: System :: Networking",
 ]
 dependencies = [
-    "typer",
-    "rich",
+    "typer>=0.12",
+    "rich>=13",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest",
-    "pytest-cov",
+    "pytest>=8",
+    "pytest-cov>=5",
+    "ruff>=0.6",
+    "mypy>=1.11",
 ]
+
+[project.urls]
+Homepage = "https://github.com/modusensus/ponte"
+Repository = "https://github.com/modusensus/ponte"
+Issues = "https://github.com/modusensus/ponte/issues"
+Changelog = "https://github.com/modusensus/ponte/blob/main/CHANGELOG.md"
 
 [project.scripts]
 ponte = "ponte.main:app"
 
 [tool.setuptools]
 packages = ["ponte"]
+
+[tool.setuptools.dynamic]
+version = { attr = "ponte.__version__" }
+
+# The example config is a *runtime* asset: `ponte init` copies it, so it must
+# ship in the wheel. Without this the installed package cannot create a config
+# file at all (the previous layout shipped nothing usable).
+[tool.setuptools.package-data]
+ponte = ["config.example.toml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -51,4 +69,29 @@ omit = ["*/__init__.py"]
 show_missing = true
 skip_covered = true
 # 阈值：低于此值 CI 视为失败，防止覆盖率回退。
-fail_under = 55
+# 当前实测约 79%（Windows），跨平台留出余量；目标见 CHANGELOG 的 80% 计划。
+fail_under = 70
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = [
+    "E501",   # 交给格式化器；仓库里有较长的 PowerShell/XML 内嵌字符串
+]
+
+[tool.ruff.lint.per-file-ignores]
+"_smoke_test.py" = ["E402", "E701", "E702", "F841", "B011", "UP031"]
+"tests/*" = ["B011"]
+# typer 要求 Option/Argument 作为参数默认值出现。
+"ponte/main.py" = ["B008"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["ponte"]
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true

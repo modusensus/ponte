@@ -1,0 +1,80 @@
+# ponte 配置模板
+#
+# 不要直接编辑本文件：它在 Python 包目录内，`pip install -U` 会覆盖它。
+# 正确用法：
+#   ponte init            # 复制到用户配置目录并提示路径
+#   ponte config          # 打印当前生效的配置与来源文件
+#
+# 配置查找顺序（先找到的生效）：
+#   1. --config <path>
+#   2. 环境变量 PONTE_CONFIG
+#   3. 用户配置目录（Windows: %APPDATA%\ponte\config.toml
+#                       Linux:   ~/.config/ponte/config.toml
+#                       macOS:   ~/Library/Application Support/ponte/config.toml）
+#   4. 包内旧位置 ponte/config.toml（已废弃，仅兼容老安装）
+#
+# 所有路径支持 ~ 与环境变量展开。
+
+[ssh]
+host = "YOUR_SERVER_IP"
+port = 22
+user = "YOUR_SSH_USER"
+# 按各平台 SSH 惯例放密钥即可（~ 自动展开）；如需自定义路径请直接改这里
+identity_file = "~/.ssh/id_rsa"
+known_hosts_file = "~/.ssh/known_hosts"
+
+[ssh.options]
+StrictHostKeyChecking = "accept-new"
+ServerAliveInterval = 30
+ServerAliveCountMax = 3
+ExitOnForwardFailure = "yes"
+TCPKeepAlive = "yes"
+# 其它未列出的键会被原样透传为 `-o key=value`，例如：
+# Compression = "yes"
+
+# 反向隧道：在服务器上打开 remote_port，转发回本地 local_host:local_port
+[[tunnels]]
+remote_port = 23334
+local_host = "localhost"
+local_port = 2222
+description = "示例：把远端 23334 转发到本地 2222"
+
+[daemon]
+# pid_file / log_file 缺省时按平台自动选择：
+#   Windows: %LOCALAPPDATA%\ponte\
+#   Linux:   ~/.local/state/ponte/
+#   macOS:   ~/Library/Application Support/ponte/
+# 需要自定义时在此指定，支持 ~ 展开。
+# pid_file = "~/ponte.pid"
+# log_file = "~/ponte.log"
+log_max_bytes = 10485760   # 10 MB
+log_backup_count = 3
+
+[retry]
+max_retries = 0            # 0 = 无限重试
+base_delay = 5             # 首次重连等待秒数
+max_delay = 300            # 退避上限（5 分钟）
+backoff_factor = 2.0
+jitter = true              # 全抖动，避免多机同时重连
+stable_after = 60          # 会话稳定运行超过该秒数后重试预算归零
+
+[health]
+check_interval = 60        # 健康检查间隔（秒）
+remote_check_enabled = true
+remote_check_timeout = 10  # 单次远程探测超时（秒）
+max_check_interval = 300   # 连续失败时检查间隔的退避上限（秒）
+
+[service]
+# 开机自启服务身份（Linux systemd 单元名 / macOS launchd label 后缀）
+name = "ponte"
+autostart = true
+kill_timeout = 5           # POSIX 优雅终止等待秒数，超时后 SIGKILL
+
+[windows]
+# 仅 Windows 使用
+task_name = "SSH-Reverse-Tunnel"
+# ssh_exe 缺省时按 PATH 自动查找；如需固定路径再取消注释
+# ssh_exe = "C:\\Windows\\System32\\OpenSSH\\ssh.exe"
+# run_as = "user"    # 默认：登录后以当前用户运行，能读 ~/.ssh 密钥、免提权
+# run_as = "system"  # 开机即起（登录前就通）：以 SYSTEM 运行，需提权，且读不到用户密钥
+run_as = "user"

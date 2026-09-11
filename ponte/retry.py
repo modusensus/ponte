@@ -28,7 +28,7 @@ from __future__ import annotations
 import random
 import threading
 import time
-from typing import Iterator, Optional
+from collections.abc import Iterator
 
 from ponte.config import RetryConfig
 from ponte.core import TunnelManager
@@ -74,10 +74,10 @@ class RetryEvent:
     def __init__(
         self,
         type: str,
-        exit_code: Optional[int] = None,
+        exit_code: int | None = None,
         delay: float = 0.0,
         attempt: int = 0,
-        error: Optional[str] = None,
+        error: str | None = None,
     ) -> None:
         self.type = type
         self.exit_code = exit_code
@@ -88,25 +88,25 @@ class RetryEvent:
     # -- Factory helpers -----------------------------------------------------
 
     @classmethod
-    def connecting(cls) -> "RetryEvent":
+    def connecting(cls) -> RetryEvent:
         return cls(cls.CONNECTING)
 
     @classmethod
-    def connected(cls) -> "RetryEvent":
+    def connected(cls) -> RetryEvent:
         return cls(cls.CONNECTED)
 
     @classmethod
     def disconnected(
-        cls, exit_code: Optional[int], error: Optional[str] = None
-    ) -> "RetryEvent":
+        cls, exit_code: int | None, error: str | None = None
+    ) -> RetryEvent:
         return cls(cls.DISCONNECTED, exit_code=exit_code, error=error)
 
     @classmethod
-    def retrying(cls, delay: float, attempt: int) -> "RetryEvent":
+    def retrying(cls, delay: float, attempt: int) -> RetryEvent:
         return cls(cls.RETRYING, delay=delay, attempt=attempt)
 
     @classmethod
-    def max_retries_reached(cls) -> "RetryEvent":
+    def max_retries_reached(cls) -> RetryEvent:
         return cls(cls.MAX_RETRIES_REACHED)
 
     # -- dunder ---------------------------------------------------------------
@@ -172,7 +172,7 @@ class RetryRunner:
         self._stop = threading.Event()
         # Last exception raised by TunnelManager.connect(), if any. Useful for
         # diagnostics after the run completes.
-        self.last_error: Optional[BaseException] = None
+        self.last_error: BaseException | None = None
 
     # -- Public API -----------------------------------------------------------
 
@@ -221,8 +221,8 @@ class RetryRunner:
                 return
 
             yield RetryEvent.connecting()
-            exit_code: Optional[int]
-            error: Optional[str]
+            exit_code: int | None
+            error: str | None
             try:
                 exit_code = manager.connect()
             except Exception as exc:  # noqa: BLE001 - must survive any failure

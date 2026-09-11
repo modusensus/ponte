@@ -13,14 +13,19 @@ from __future__ import annotations
 import os
 import sys
 import time
-from typing import Optional
+from pathlib import Path
+from typing import TYPE_CHECKING, NoReturn
 
 import typer
 from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
-from ponte.config import get_config
+from ponte import __version__
+from ponte.config import ConfigError, get_config, init_config, set_config_path
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle guard, runtime import is lazy
+    from ponte.daemon import TunnelDaemon
 
 __all__ = ["app"]
 
@@ -46,11 +51,38 @@ _configure_utf8_stdio()
 
 app = typer.Typer(
     no_args_is_help=True,
+    invoke_without_command=True,
     help="管理 SSH 反向隧道守护进程的命令行工具",
     add_completion=False,
 )
 console = Console()
 err_console = Console(stderr=True)
+
+
+@app.callback()
+def main(
+    ctx: typer.Context,
+    config_file: Path | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        metavar="PATH",
+        help="使用的配置文件（默认按 PONTE_CONFIG → 用户配置目录 → 包内旧位置顺序查找）",
+    ),
+    version: bool = typer.Option(
+        False, "--version", "-V", help="显示版本号并退出", is_eager=True
+    ),
+) -> None:
+    """全局选项：``--version`` 与 ``--config``。"""
+    if version:
+        console.print(f"ponte {__version__}")
+        raise typer.Exit()
+    if config_file is not None:
+        set_config_path(config_file)
+        if ctx.invoked_subcommand is None:
+            # 只给了全局选项、没给子命令：打印帮助而不是静默退出。
+            console.print(ctx.get_help())
+            raise typer.Exit()
 
 #: Tokens inside a DaemonStatus.message that indicate a force kill was needed.
 _FORCE_KILL_TOKENS = ("kill", "force", "强制", "强杀")
@@ -59,7 +91,7 @@ _FORCE_KILL_TOKENS = ("kill", "force", "强制", "强杀")
 _FOLLOW_POLL_INTERVAL = 0.25
 
 
-def _daemon() -> "TunnelDaemon":
+def _daemon() -> TunnelDaemon:
     """Return a daemon instance bound to the effective configuration.
 
     The ``ponte.daemon`` module is imported lazily so that config-only
@@ -71,7 +103,7 @@ def _daemon() -> "TunnelDaemon":
     return TunnelDaemon(config=get_config())
 
 
-def _fail(message: str) -> None:
+def _fail(message: str) -> NoReturn:
     """Print a red ``错误：`` message to stderr and exit with status 1."""
     err_console.print(f"[bold red]错误：{escape(message)}[/bold red]")
     raise typer.Exit(code=1)
@@ -111,7 +143,7 @@ def start(
                 code = daemon.run()
             except (KeyboardInterrupt, typer.Abort):
                 console.print("\n[yellow]已停止[/yellow]")
-                raise typer.Exit(code=0)
+                raise typer.Exit(code=0) from None
             raise typer.Exit(code=code or 0)
 
         pid = daemon.start()
@@ -190,7 +222,7 @@ def status() -> None:
             health_markup = "[yellow]未知[/yellow]"
         else:
             detail = escape(s.health_error or "")
-            health_markup = f"[red]异常[/red]" + (f"（{detail}）" if detail else "")
+            health_markup = "[red]异常[/red]" + (f"（{detail}）" if detail else "")
         table.add_row("健康状态", health_markup)
 
         if s.remote_ports:
@@ -255,7 +287,7 @@ def logs(
             _follow_log(log_file, offset)
         except KeyboardInterrupt:
             console.print("\n[yellow]已停止跟随[/yellow]")
-            raise typer.Exit(code=0)
+            raise typer.Exit(code=0) from None
     except typer.Exit:
         raise
     except Exception as exc:
@@ -363,24 +395,54 @@ def config() -> None:
             "retry",
             f"max_retries={retry.max_retries}, base_delay={retry.base_delay}s, "
             f"max_delay={retry.max_delay}s, backoff_factor={retry.backoff_factor}, "
-            f"jitter={'on' if retry.jitter else 'off'}",
+            f"jitter={'on' if retry.jitter else 'off'}, "
+            f"stable_after={retry.stable_after}s",
         )
         table.add_row(
             "health",
             f"check_interval={health.check_interval}s, "
             f"remote_check={'on' if health.remote_check_enabled else 'off'}, "
-            f"remote_check_timeout={health.remote_check_timeout}s",
+            f"remote_check_timeout={health.remote_check_timeout}s, "
+            f"max_check_interval={health.max_check_interval}s",
         )
         table.add_row("pid_file", cfg.daemon.pid_file or "（默认）")
         table.add_row("log_file", cfg.daemon.log_file or "（默认）")
         table.add_row("ssh_exe", cfg.windows.ssh_exe or "ssh（PATH）")
+        table.add_row("windows.run_as", cfg.windows.run_as)
         table.add_row("配置文件", cfg.source_path)
 
         console.print(table)
+
+        for warning in cfg.warnings:
+            console.print(f"[yellow]警告：{escape(warning)}[/yellow]")
     except typer.Exit:
         raise
     except Exception as exc:
         _fail(str(exc))
+
+
+@app.command()
+def init(
+    path: Path | None = typer.Option(
+        None, "--path", help="写入路径（默认写入用户配置目录）"
+    ),
+    force: bool = typer.Option(False, "--force", help="覆盖已存在的配置文件"),
+) -> None:
+    """生成配置文件（默认复制到用户配置目录，不覆盖已有文件）。"""
+    try:
+        target = init_config(path, force=force)
+    except (ConfigError, OSError) as exc:
+        _fail(str(exc))
+
+    console.print(f"[green]已写入配置：{escape(target)}[/green]")
+    console.print(
+        "[dim]请填写 "
+        + escape("[ssh]")
+        + " 的 host / user / identity_file，然后运行 ponte test[/dim]"
+    )
+    console.print(
+        "[dim]换其它配置文件：ponte --config <path> … 或设置 PONTE_CONFIG[/dim]"
+    )
 
 
 if __name__ == "__main__":

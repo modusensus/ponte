@@ -1,4 +1,8 @@
-# SSH Tunnel Manager v2.0
+# SSH Tunnel Manager v2.0 — DEPRECATED, kept for reference only.
+# Superseded by the `ponte` CLI (see ../legacy/README.md for the command map).
+# Hardcoded paths (C:\ssh-tunnel, D:\Git\usr\bin\ssh.exe) make this
+# machine-specific; prefer `ponte install`.
+#
 # CLI tool for managing persistent SSH reverse tunnel to cloud server
 # Usage: powershell -ExecutionPolicy Bypass -File tunnel.ps1 <command>
 # Commands: start, stop, status, restart, install, uninstall, log

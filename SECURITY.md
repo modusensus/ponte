@@ -47,14 +47,20 @@ you run.
 Things worth knowing when running ponte:
 
 - **The private key must never be committed.** `.gitignore` excludes
-  `id_rsa` / `id_rsa.pub`; keys are read from the path in `config.toml`.
-- **`config.toml` is real configuration, not a template.** It holds the SSH
-  host/user and key paths. Commit placeholders, not real endpoints.
+  `id_rsa` / `id_rsa.pub`; keys are read from the path in your config file.
+  Never copy a private key into the repository directory — the deprecated
+  `legacy/setup.ps1` used to do exactly that and its key-copying logic was
+  removed.
+- **Your real config is not a template.** It holds the SSH host/user and key
+  paths, and it lives *outside* the repository (created by `ponte init`,
+  e.g. `~/.config/ponte/config.toml`). Only the placeholder
+  `ponte/config.example.toml` is shipped.
 - **Remote-port probing runs commands on your SSH server.** Only configure
   servers you trust; the probe uses a Python socket connect first and falls
   back to `ss`/`lsof`/`netstat`.
 - **The daemon runs as your user** (or SYSTEM via the Windows Scheduled
-  Task). Protect access to the machine and to `config.toml`.
+  Task). Protect access to the machine and to your config file — it is read by
+  the daemon on every start, and `--config` / `$PONTE_CONFIG` decide which one.
 
 ---
 
@@ -98,10 +104,13 @@ Things worth knowing when running ponte:
 运行 ponte 时值得注意的事项：
 
 - **私钥绝不可入库。** `.gitignore` 已排除 `id_rsa` / `id_rsa.pub`；密钥从
-  `config.toml` 中指定的路径读取。
-- **`config.toml` 是真实配置而非模板。** 它包含 SSH host/user 与密钥路径。
-  请提交占位符，而非真实端点。
+  配置文件指定的路径读取。也不要把私钥复制进仓库目录——已废弃的
+  `legacy/setup.ps1` 曾这么做，相关逻辑已删除。
+- **真实配置不是模板。** 它包含 SSH host/user 与密钥路径，且存放在**仓库之外**
+  （用 `ponte init` 生成，例如 `~/.config/ponte/config.toml`）。仓库里只有
+  占位符模板 `ponte/config.example.toml`。
 - **远程端口探测会在你的 SSH 服务器上执行命令。** 只配置你信任的服务器；
   探测优先用 Python socket 连接，回退到 `ss`/`lsof`/`netstat`。
 - **守护进程以你的用户身份运行**（或经 Windows 计划任务以 SYSTEM 运行）。
-  请保护好机器与 `config.toml` 的访问权限。
+  请保护好机器与配置文件的访问权限——守护进程每次启动都会读取它，而
+  `--config` / `$PONTE_CONFIG` 决定读哪一份。

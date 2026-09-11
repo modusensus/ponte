@@ -11,7 +11,7 @@ from __future__ import annotations
 import dataclasses
 import threading
 import time
-from typing import Callable, Dict, Optional
+from collections.abc import Callable
 
 from ponte.config import HealthConfig
 from ponte.core import TunnelManager
@@ -37,10 +37,10 @@ class HealthStatus:
     """
 
     process_alive: bool
-    remote_ports: Dict[int, bool]
+    remote_ports: dict[int, bool]
     all_healthy: bool
     timestamp: float
-    error: Optional[str] = None
+    error: str | None = None
 
     def __str__(self) -> str:  # human-friendly one-liner for logs
         ports = {
@@ -77,7 +77,7 @@ class HealthChecker:
         # Last exception raised by a user callback in run_loop(), if any. The
         # loop swallows callback errors so one bad callback cannot kill the
         # monitor, but it records the most recent one here for diagnostics.
-        self.last_callback_error: Optional[BaseException] = None
+        self.last_callback_error: BaseException | None = None
 
     # -- Checks ---------------------------------------------------------------
 
@@ -98,7 +98,7 @@ class HealthChecker:
             error_messages.append(f"process check failed: {type(exc).__name__}: {exc}")
 
         # 2. Are the remote forwarding ports listening?
-        remote_ports: Dict[int, bool] = {}
+        remote_ports: dict[int, bool] = {}
         if self.remote_check_enabled:
             try:
                 remote_ports = self.check_remote_ports()
@@ -127,7 +127,7 @@ class HealthChecker:
             error=error,
         )
 
-    def check_remote_ports(self) -> Dict[int, bool]:
+    def check_remote_ports(self) -> dict[int, bool]:
         """Probe remote ports via ``manager.check_remote_ports()``.
 
         Returns a ``{port: bool}`` mapping of which configured remote ports are
@@ -158,7 +158,7 @@ class HealthChecker:
     # -- Background loop ------------------------------------------------------
 
     def run_loop(
-        self, interval: Optional[float] = None, callback: Optional[HealthCallback] = None
+        self, interval: float | None = None, callback: HealthCallback | None = None
     ) -> threading.Event:
         """Run checks every ``interval`` seconds in a background daemon thread.
 
@@ -191,6 +191,7 @@ class HealthChecker:
 
         def _loop() -> None:
             failures = 0
+            wait = interval
 
             def _advance(healthy: bool) -> None:
                 """Update the consecutive-failure counter and next wait."""
@@ -201,7 +202,6 @@ class HealthChecker:
                     failures += 1
                 wait = self._backoff_interval(interval, failures, max_interval)
 
-            wait = interval
             try:
                 status = self.check()
             except Exception as exc:  # noqa: BLE001 - check() should not
