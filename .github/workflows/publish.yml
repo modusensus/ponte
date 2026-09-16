@@ -1,0 +1,111 @@
+name: Publish
+
+# Publishes the `ponte-cli` distribution to PyPI with Trusted Publishing (OIDC),
+# so no API token is stored in this repository.
+#
+# One-time setup, on PyPI (not in this repo):
+#   https://pypi.org/manage/account/publishing/ -> "Add a new pending publisher"
+#     PyPI project name: ponte-cli
+#     Owner:             modusensus
+#     Repository name:   ponte
+#     Workflow name:     publish.yml
+#     Environment name:  pypi
+#   The `pypi` environment below must match that name. The name `ponte` itself is
+#   taken on PyPI by an unrelated project, hence the `-cli` distribution name;
+#   the import package and the command are both still `ponte`.
+#
+# Releasing: bump `__version__`, add a CHANGELOG entry, then push an annotated
+# `v<version>` tag. main is protected, so land the version bump through a PR
+# first (see CONTRIBUTING.md).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build & verify distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # A tag that disagrees with the packaged version publishes the wrong thing
+      # (or fails halfway), so refuse it before building anything.
+      - name: Fail unless the tag matches the package version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          python - <<'PY'
+          import os, pathlib, re
+
+          source = pathlib.Path("ponte/__init__.py").read_text(encoding="utf-8")
+          match = re.search(r'__version__\s*=\s*"([^"]+)"', source)
+          assert match, "cannot find __version__ in ponte/__init__.py"
+          version = match.group(1)
+          tag = os.environ["GITHUB_REF_NAME"]
+          if tag != f"v{version}":
+              raise SystemExit(f"tag {tag} does not match package version v{version}")
+          print(f"tag {tag} matches package version {version}")
+          PY
+
+      - name: Build sdist + wheel
+        run: python -m pip install --upgrade build && python -m build
+
+      - name: Assert the wheel is publishable
+        run: |
+          python - <<'PY'
+          import glob, os, sys, zipfile
+
+          wheels = glob.glob("dist/*.whl")
+          assert len(wheels) == 1, f"expected exactly one wheel, got {wheels}"
+          filename = os.path.basename(wheels[0])
+          # Publishing under the wrong distribution name would create a bogus
+          # PyPI project, so check it here rather than discovering it on PyPI.
+          if not filename.startswith("ponte_cli-"):
+              sys.exit(f"unexpected distribution name: {filename}")
+          names = zipfile.ZipFile(wheels[0]).namelist()
+          print("\n".join(names))
+          if "ponte/config.example.toml" not in names:
+              sys.exit("packaging regression: config.example.toml missing from the wheel")
+          PY
+
+      - name: Install the wheel and exercise the CLI
+        run: |
+          python -m pip install dist/*.whl
+          ponte --version
+          # `ponte init` must work from a clean install: that is the failure the
+          # 0.3.0 packaging fix addressed, and this job guards it for releases.
+          export HOME="$RUNNER_TEMP/fakehome"
+          mkdir -p "$HOME"
+          ponte init --path "$RUNNER_TEMP/release.toml"
+          test -f "$RUNNER_TEMP/release.toml"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/ponte-cli/
+    permissions:
+      id-token: write # OIDC token minted per run; no long-lived PyPI secret
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
