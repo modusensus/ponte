@@ -89,9 +89,28 @@ ponte install    # re-register the service so it passes --config
 
 ## [0.2.1]
 
-Initial public release: retry loop with exponential backoff + jitter, health
-checks with a zombie-tunnel force reconnect, and auto-start services for
-Windows (Scheduled Task), Linux (systemd user) and macOS (launchd).
+Tunnel stability fixes (PR #1): a "zombie" SSH process (alive but ports down)
+is force-reconnected after 3 consecutive failed health checks; a session that
+stays up ≥ `stable_after` seconds resets the retry budget; health-check
+intervals back off exponentially during outages (`max_check_interval`); SSH
+stderr is read in real time. New `[retry] stable_after` and
+`[health] max_check_interval` options.
+
+## [0.2.0]
+
+- `windows.run_as` — choose the Scheduled Task identity/timing: `user`
+  (logon) or `system` (boot).
+- The SSH console window is suppressed on Windows.
+
+## [0.1.0]
+
+Initial release of the Python CLI: retry loop with exponential backoff +
+jitter, health checks, auto-start services for Windows (Scheduled Task),
+Linux (systemd user) and macOS (launchd), cross-platform `ssh` resolution,
+and the pytest suite with CI/Codecov.
 
 [Unreleased]: https://github.com/modusensus/ponte/compare/v0.3.0...HEAD
 [0.3.0]: https://github.com/modusensus/ponte/releases/tag/v0.3.0
+[0.2.1]: https://github.com/modusensus/ponte/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/modusensus/ponte/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/modusensus/ponte/releases/tag/v0.1.0
