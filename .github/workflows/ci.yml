@@ -79,10 +79,15 @@ jobs:
       - name: Assert the example config is inside the wheel
         run: |
           python - <<'PY'
-          import glob, sys, zipfile
+          import glob, os, sys, zipfile
 
           wheels = glob.glob("dist/*.whl")
           assert wheels, "no wheel produced"
+          filename = os.path.basename(wheels[0])
+          # The distribution name is what PyPI and `pip install` see; it must stay
+          # `ponte-cli` while the import package and the command stay `ponte`.
+          if not filename.startswith("ponte_cli-"):
+              sys.exit(f"unexpected distribution name: {filename}")
           names = zipfile.ZipFile(wheels[0]).namelist()
           print("\n".join(names))
           if "ponte/config.example.toml" not in names:

@@ -42,7 +42,7 @@
 ## 🚀 Quick start
 
 ```bash
-pipx install .          # or: pip install .   (pipx keeps it isolated)
+pipx install ponte-cli  # or: pip install ponte-cli   (pipx keeps it isolated)
 ponte init              # create the config file and print its path
 $EDITOR ~/.config/ponte/config.toml   # set host/user, point identity_file at your key
 ponte test              # verify SSH connectivity
@@ -52,8 +52,9 @@ ponte install           # register auto-start + crash restart
 ```
 
 No config file yet? `ponte init` writes one from the shipped template. The
-config lives **outside** the package, so `pip install -U ponte` never touches
-it.
+config lives **outside** the package, so `pip install -U ponte-cli` never
+touches it. The PyPI distribution is `ponte-cli`, while the command and the
+import package stay `ponte`; a checkout installs the same way (`pipx install .`).
 
 ## ⌨️ Commands
 
@@ -200,7 +201,7 @@ again. See [CONTRIBUTING.md](CONTRIBUTING.md).
 ## 🚀 快速开始
 
 ```bash
-pipx install .          # 或 pip install .（pipx 会隔离安装）
+pipx install ponte-cli  # 或 pip install ponte-cli（pipx 会隔离安装）
 ponte init              # 生成配置文件并打印路径
 $EDITOR ~/.config/ponte/config.toml   # 填 host/user，identity_file 指向你的密钥
 ponte test              # 验证 SSH 连通性
@@ -210,7 +211,8 @@ ponte install           # 注册开机自启 + 崩溃重启
 ```
 
 还没有配置文件？`ponte init` 会从内置模板生成一份。配置存放在**包外**，
-`pip install -U ponte` 不会覆盖它。
+`pip install -U ponte-cli` 不会覆盖它。PyPI 上的发行名是 `ponte-cli`，
+命令与导入包名仍为 `ponte`（从源码目录安装同样可用 `pipx install .`）。
 
 ## ⌨️ 命令
 
