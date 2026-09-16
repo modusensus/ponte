@@ -17,6 +17,7 @@ import types
 import pytest
 
 from ponte.config import SSHConfig, Tunnel, TunnelConfig, WindowsConfig
+from ponte.core import creation_flags
 from ponte.daemon import (
     DaemonStatus,
     TunnelDaemon,
@@ -24,6 +25,7 @@ from ponte.daemon import (
     _derive_status_file,
     _derive_stop_marker,
     _encode_ps,
+    _run_tool,
 )
 from ponte.health import HealthStatus
 
@@ -143,32 +145,89 @@ def test_cleanup_removes_pid_and_marker(tmp_path) -> None:
     assert not os.path.exists(d.stop_marker)
 
 
-def test_pythonw_path_when_executable_is_pythonw(monkeypatch, tmp_path) -> None:
-    cfg = _cfg(tmp_path)
-    d = TunnelDaemon(cfg)
-    monkeypatch.setattr(sys, "executable", r"C:\Python\pythonw.exe")
-    assert d._pythonw_path() == r"C:\Python\pythonw.exe"
+def _windows_path_semantics(monkeypatch, *, executable: str, existing: set[str]) -> None:
+    """模拟 Windows 路径语义（POSIX 上 os.path 用 / 会破坏匹配）。
 
-
-def test_pythonw_path_falls_back_to_python(monkeypatch, tmp_path) -> None:
-    cfg = _cfg(tmp_path)
-    d = TunnelDaemon(cfg)
-    monkeypatch.setattr(sys, "executable", r"C:\Python\python.exe")
-    # 模拟 Windows 分隔符语义（POSIX 上 os.path.join 用 / 会破坏匹配）：
-    # split 拆出目录，join 用反斜杠拼接，pythonw.exe 存在。
+    同样把 ``exists`` 限定成白名单，保证「有/没有 pythonw.exe」两种情形都能
+    在任意平台上确定性地复现。
+    """
+    monkeypatch.setattr(sys, "executable", executable)
     monkeypatch.setattr(
-        "ponte.daemon.os.path.split",
-        lambda _p: (r"C:\Python", "python.exe"),
+        "ponte.daemon.os.path.basename", lambda _p: executable.split("\\")[-1]
+    )
+    monkeypatch.setattr(
+        "ponte.daemon.os.path.dirname",
+        lambda _p: "\\".join(executable.split("\\")[:-1]),
     )
     monkeypatch.setattr(
         "ponte.daemon.os.path.join",
         lambda *parts: "\\".join(str(p).rstrip("\\/") for p in parts),
     )
+    known = {p.lower() for p in existing}
     monkeypatch.setattr(
-        "ponte.daemon.os.path.exists",
-        lambda p: str(p).lower() == r"c:\python\pythonw.exe",
+        "ponte.daemon.os.path.exists", lambda p: str(p).lower() in known
+    )
+
+
+def test_pythonw_path_when_executable_is_pythonw(monkeypatch, tmp_path) -> None:
+    d = TunnelDaemon(_cfg(tmp_path))
+    _windows_path_semantics(
+        monkeypatch, executable=r"C:\Python\pythonw.exe", existing=set()
     )
     assert d._pythonw_path() == r"C:\Python\pythonw.exe"
+
+
+def test_pythonw_path_prefers_sibling_pythonw(monkeypatch, tmp_path) -> None:
+    d = TunnelDaemon(_cfg(tmp_path))
+    _windows_path_semantics(
+        monkeypatch,
+        executable=r"C:\Python\python.exe",
+        existing={r"C:\Python\pythonw.exe"},
+    )
+    assert d._pythonw_path() == r"C:\Python\pythonw.exe"
+
+
+def test_pythonw_path_refuses_to_fall_back_to_console_python(
+    monkeypatch, tmp_path
+) -> None:
+    """没有 pythonw.exe 时必须拒绝安装，而不是静默退回 python.exe 去弹窗。"""
+    d = TunnelDaemon(_cfg(tmp_path))
+    _windows_path_semantics(
+        monkeypatch, executable=r"C:\Python\python.exe", existing=set()
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        d._pythonw_path()
+    message = str(excinfo.value)
+    assert "pythonw.exe" in message
+    assert "pythonw_exe" in message  # 告诉用户怎么修
+    assert r"C:\Python\python.exe" in message
+
+
+def test_pythonw_path_honours_configured_exe(monkeypatch, tmp_path) -> None:
+    """[windows] pythonw_exe 显式指定时优先使用它。"""
+    configured = r"D:\Other\pythonw.exe"
+    cfg = dataclasses.replace(
+        _cfg(tmp_path),
+        windows=WindowsConfig(run_as="user", pythonw_exe=configured),
+    )
+    d = TunnelDaemon(cfg)
+    _windows_path_semantics(
+        monkeypatch, executable=r"C:\Python\python.exe", existing={configured}
+    )
+    assert d._pythonw_path() == configured
+
+
+def test_pythonw_path_rejects_missing_configured_exe(monkeypatch, tmp_path) -> None:
+    cfg = dataclasses.replace(
+        _cfg(tmp_path),
+        windows=WindowsConfig(run_as="user", pythonw_exe=r"D:\Gone\pythonw.exe"),
+    )
+    d = TunnelDaemon(cfg)
+    _windows_path_semantics(
+        monkeypatch, executable=r"C:\Python\python.exe", existing=set()
+    )
+    with pytest.raises(RuntimeError, match="pythonw_exe"):
+        d._pythonw_path()
 
 
 def _capture_install_script(monkeypatch, tmp_path, *, run_as: str) -> str:
@@ -519,3 +578,65 @@ def test_install_service_dispatch_rejects_unknown_platform(monkeypatch, tmp_path
         d.install_service()
     with pytest.raises(RuntimeError):
         d.uninstall_service()
+
+
+# ---------------------------------------------------------------------------
+# 不得弹窗：外部工具调用必须一律经过 creation_flags()
+# ---------------------------------------------------------------------------
+
+
+def _record_run_with_kwargs() -> tuple[list[tuple[list[str], dict]], object]:
+    """记录 (args, kwargs)，用于断言 creationflags 是否被传递。"""
+    calls: list[tuple[list[str], dict]] = []
+
+    def _run(args, **kwargs):
+        calls.append((list(args), dict(kwargs)))
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    return calls, _run
+
+
+def test_force_kill_hides_console_on_windows(monkeypatch, tmp_path) -> None:
+    """taskkill 必须带 creationflags，否则停止时会闪出黑色控制台窗口。"""
+    d = TunnelDaemon(_cfg(tmp_path))
+    calls, recorder = _record_run_with_kwargs()
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr("ponte.daemon.subprocess.run", recorder)
+
+    d._force_kill(4242)
+
+    (args, kwargs), = calls
+    assert args[:2] == ["taskkill", "/PID"]
+    assert "creationflags" in kwargs
+    assert kwargs["creationflags"] == creation_flags()
+
+
+def test_install_scheduled_task_refuses_without_pythonw(monkeypatch, tmp_path) -> None:
+    """没有无窗口解释器时 install 必须报错，而不是注册一个每次登录弹窗的任务。"""
+    d = TunnelDaemon(_cfg(tmp_path, run_as="user"))
+    monkeypatch.setattr(sys, "platform", "win32")
+    _windows_path_semantics(
+        monkeypatch, executable=r"C:\Python\python.exe", existing=set()
+    )
+    registered: list[str] = []
+    monkeypatch.setattr(
+        d, "_run_powershell", lambda script: registered.append(script) or "installed"
+    )
+
+    with pytest.raises(RuntimeError, match="pythonw"):
+        d.install_scheduled_task()
+
+    assert registered == []  # 计划任务一枚都不能注册出去
+
+
+def test_service_tool_calls_go_through_run_tool(monkeypatch, tmp_path) -> None:
+    """systemctl / launchctl 也必须经 _run_tool（统一带上 creationflags）。"""
+    calls, recorder = _record_run_with_kwargs()
+    monkeypatch.setattr("ponte.daemon.subprocess.run", recorder)
+
+    _run_tool(["systemctl", "--user", "daemon-reload"])
+
+    (args, kwargs), = calls
+    assert args == ["systemctl", "--user", "daemon-reload"]
+    assert kwargs["creationflags"] == creation_flags()
+    assert kwargs["capture_output"] is True and kwargs["text"] is True
