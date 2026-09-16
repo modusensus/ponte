@@ -6,11 +6,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The PyPI distribution is `ponte-cli`.** The bare name `ponte` is already
+  taken on PyPI by an unrelated project, so `pyproject.toml` declares
+  `name = "ponte-cli"`. The import package (`ponte`), the console command
+  (`ponte`) and the repository name are unchanged, so an install from a
+  checkout behaves exactly as before.
+
+### Added
+
+- `.github/workflows/publish.yml` — tag-triggered publishing to PyPI via Trusted
+  Publishing (OIDC, no stored token). It refuses a tag that does not match the
+  version in `ponte/__init__.py`, and verifies the wheel's distribution name and
+  contents (`config.example.toml`) before uploading.
+
 ### Planned
 
 - Coverage threshold raised from 70% to 80% (needs more `daemon.run()` tests).
 - `ruff format --check` in CI once the tree is formatted.
-- PyPI release workflow (`publish.yml`) wired to tag pushes.
 
 ## [0.3.0] - 2026-09-12
 

@@ -3,7 +3,12 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ponte"
+# PyPI distribution name. The bare name `ponte` is already taken on PyPI by an
+# unrelated project, so the distribution (what `pip install` and PyPI see) is
+# `ponte-cli` -- while the import package (`packages = ["ponte"]` below), the
+# console command (`[project.scripts] ponte`) and the repository name all stay
+# `ponte`. Users install `ponte-cli` and still run `ponte ...`.
+name = "ponte-cli"
 dynamic = ["version"]
 description = "Persistent SSH reverse tunnel daemon CLI (Windows / Linux / macOS)"
 readme = "README.md"

@@ -88,6 +88,25 @@ e.g. fix(daemon): fail loudly when service install is rejected
 
 Types: `feat`, `fix`, `docs`, `test`, `refactor`, `chore`.
 
+## Releasing
+
+Releases go out **only** through the tag-triggered `publish.yml` workflow. The
+PyPI distribution is `ponte-cli`; the console command and the import package
+stay `ponte`.
+
+1. Bump `__version__` in `ponte/__init__.py` and add a CHANGELOG entry.
+2. Merge that through a PR (`main` is protected).
+3. Tag the merged commit and push the tag:
+   `git tag -a v0.3.1 -m "v0.3.1: ..." && git push origin v0.3.1`.
+4. The workflow builds the sdist/wheel, refuses a tag/version mismatch, installs
+   the wheel and runs `ponte init`, then publishes over OIDC. Watch it under
+   Actions, then write the GitHub Release from the CHANGELOG highlights.
+
+Credentials live on PyPI, not in this repository: add a *pending* trusted
+publisher with project name `ponte-cli`, owner `modusensus`, repository `ponte`,
+workflow `publish.yml` and environment `pypi` — and keep the `pypi` environment
+name in the workflow in sync with it.
+
 ## Before you open a change
 
 1. `pytest` passes locally.
@@ -180,6 +199,23 @@ type(scope): short summary
 ```
 
 类型：`feat` / `fix` / `docs` / `test` / `refactor` / `chore`。
+
+## 发布
+
+发布**只**走 tag 触发的 `publish.yml` 工作流。PyPI 上的发行名是
+`ponte-cli`；命令行与导入包名仍是 `ponte`。
+
+1. 提升 `ponte/__init__.py` 里的 `__version__` 并补 CHANGELOG。
+2. 通过 PR 合入（`main` 受保护）。
+3. 在合并后的提交上打附注 tag 并推送：
+   `git tag -a v0.3.1 -m "v0.3.1: ..." && git push origin v0.3.1`。
+4. 工作流会构建 sdist/wheel、拒绝 tag 与包版本不一致的情况、装 wheel 跑
+   `ponte init`，最后经 OIDC 发布到 PyPI。到 Actions 盯结果，
+   再按 CHANGELOG 写 GitHub Release。
+
+发布凭据配置在 PyPI 侧而非仓库里：添加一个 **pending** trusted publisher，
+项目名 `ponte-cli`、owner `modusensus`、仓库 `ponte`、工作流 `publish.yml`、
+环境 `pypi`，并让工作流里的 `pypi` 环境名与之保持一致。
 
 ## 提交前检查
 
