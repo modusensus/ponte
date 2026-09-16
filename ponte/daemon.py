@@ -95,6 +95,29 @@ def _decode_console(data: bytes) -> str:
         return data.decode("gbk", errors="replace")
 
 
+def _run_tool(
+    args: list[str],
+    *,
+    check: bool = False,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run an external control tool (``taskkill`` / ``systemctl`` / ``launchctl``).
+
+    Every child process goes through :func:`creation_flags`, so a console window
+    can never flash. That matters most for ``taskkill``: the daemon normally runs
+    windowless (``pythonw`` / Scheduled Task), so a bare ``subprocess.run`` would
+    pop a black box in the user's face the moment they ask ponte to stop.
+    """
+    return subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        check=check,
+        timeout=timeout,
+        creationflags=creation_flags(),
+    )
+
+
 @dataclasses.dataclass
 class DaemonStatus:
     """A snapshot of daemon state for the ``status``/``stop`` commands."""
@@ -499,11 +522,10 @@ class TunnelDaemon:
         configured grace period, so the daemon gets a chance to clean up.
         """
         if sys.platform == "win32":
-            subprocess.run(
-                ["taskkill", "/PID", str(pid), "/T", "/F"],
-                capture_output=True,
-                text=True,
-            )
+            # `taskkill` is a console program: spawning it bare flashes a black
+            # box at exactly the wrong moment -- while the user is trying to
+            # stop a windowless daemon.
+            _run_tool(["taskkill", "/PID", str(pid), "/T", "/F"])
             return
         # POSIX: graceful SIGTERM, then escalate to SIGKILL.
         try:
@@ -583,20 +605,9 @@ class TunnelDaemon:
                 self._run_powershell_stop_task()
             elif sys.platform == "linux":
                 name = self.config.service.name
-                subprocess.run(
-                    ["systemctl", "--user", "stop", f"{name}.service"],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
+                _run_tool(["systemctl", "--user", "stop", f"{name}.service"])
             elif sys.platform == "darwin":
-                plist = self._launchd_plist()
-                subprocess.run(
-                    ["launchctl", "unload", plist],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
+                _run_tool(["launchctl", "unload", self._launchd_plist()])
         except Exception as exc:  # noqa: BLE001 - best effort
             logger.debug("could not stop service autostart: %s", exc)
 
@@ -633,32 +644,23 @@ class TunnelDaemon:
         )
         with open(unit_path, "w", encoding="utf-8") as handle:
             handle.write(unit)
-        subprocess.run(
-            ["systemctl", "--user", "daemon-reload"],
-            check=True, capture_output=True, text=True,
-        )
-        subprocess.run(
+        _run_tool(["systemctl", "--user", "daemon-reload"], check=True)
+        _run_tool(
             ["systemctl", "--user", "enable", "--now", f"{name}.service"],
-            check=True, capture_output=True, text=True,
+            check=True,
         )
         return "installed"
 
     def _uninstall_systemd(self) -> str:
         """Disable+stop the systemd user unit and remove the file."""
         name = self.config.service.name
-        subprocess.run(
-            ["systemctl", "--user", "disable", "--now", f"{name}.service"],
-            capture_output=True, text=True, check=False,
-        )
+        _run_tool(["systemctl", "--user", "disable", "--now", f"{name}.service"])
         unit_path = os.path.join(
             os.path.expanduser("~/.config/systemd/user"), f"{name}.service"
         )
         if os.path.exists(unit_path):
             os.remove(unit_path)
-        subprocess.run(
-            ["systemctl", "--user", "daemon-reload"],
-            capture_output=True, text=True, check=False,
-        )
+        _run_tool(["systemctl", "--user", "daemon-reload"])
         return "uninstalled"
 
     def _install_launchd(self) -> str:
@@ -692,19 +694,13 @@ class TunnelDaemon:
         )
         with open(plist_path, "w", encoding="utf-8") as handle:
             handle.write(plist)
-        subprocess.run(
-            ["launchctl", "load", "-w", plist_path],
-            check=True, capture_output=True, text=True,
-        )
+        _run_tool(["launchctl", "load", "-w", plist_path], check=True)
         return "installed"
 
     def _uninstall_launchd(self) -> str:
         """Unload and remove the LaunchAgent plist."""
         plist_path = self._launchd_plist()
-        subprocess.run(
-            ["launchctl", "unload", "-w", plist_path],
-            capture_output=True, text=True, check=False,
-        )
+        _run_tool(["launchctl", "unload", "-w", plist_path])
         if os.path.exists(plist_path):
             os.remove(plist_path)
         return "uninstalled"
@@ -771,12 +767,42 @@ Write-Output 'installed'
         self._run_powershell(script)
 
     def _pythonw_path(self) -> str:
-        """Return a ``pythonw.exe`` path next to ``sys.executable``, if any."""
-        base, name = os.path.split(sys.executable)
-        if name.lower().startswith("pythonw"):
+        """Return the *windowless* interpreter the Scheduled Task must run.
+
+        ``pythonw.exe`` is what keeps a logon/boot task from flashing a console
+        window, so this deliberately never falls back to ``python.exe``: a
+        console interpreter in an interactive task is precisely the "sometimes
+        it does not start silently" popup.
+
+        Resolution order:
+
+        1. ``[windows] pythonw_exe``, when configured.
+        2. ``sys.executable`` itself, when it already is a ``pythonw`` binary.
+        3. ``pythonw.exe`` next to ``sys.executable``.
+
+        Raises:
+            RuntimeError: when none of the above exists, naming the interpreter
+                and the two available fixes rather than installing a task that
+                pops up a console window at every logon.
+        """
+        configured = self.config.windows.pythonw_exe
+        if configured:
+            if os.path.exists(configured):
+                return configured
+            raise RuntimeError(
+                f"[windows] pythonw_exe 指向的路径不存在：{configured}"
+            )
+        if os.path.basename(sys.executable).lower().startswith("pythonw"):
             return sys.executable
-        candidate = os.path.join(base, "pythonw.exe")
-        return candidate if os.path.exists(candidate) else sys.executable
+        candidate = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+        if os.path.exists(candidate):
+            return candidate
+        raise RuntimeError(
+            "找不到 pythonw.exe（只有 python.exe）：用它注册计划任务会在每次登录时"
+            f"弹出黑色控制台窗口，因此已中止安装。当前解释器：{sys.executable}。"
+            "可选解决办法：① 用 pipx 安装（其虚拟环境自带 pythonw.exe）；"
+            "② 在配置里显式指定 [windows] pythonw_exe = \"...pythonw.exe\"。"
+        )
 
     def _run_powershell(self, script: str, timeout: float = 90.0) -> str:
         """Run a PowerShell snippet via ``-EncodedCommand`` and return stdout."""

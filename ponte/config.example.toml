@@ -75,6 +75,12 @@ kill_timeout = 5           # POSIX 优雅终止等待秒数，超时后 SIGKILL
 task_name = "SSH-Reverse-Tunnel"
 # ssh_exe 缺省时按 PATH 自动查找；如需固定路径再取消注释
 # ssh_exe = "C:\\Windows\\System32\\OpenSSH\\ssh.exe"
+#
+# pythonw_exe：计划任务使用的「无窗口」解释器。缺省时优先用 sys.executable
+# 同目录的 pythonw.exe。必须是无窗口解释器——否则每次登录都会闪出黑色
+# 控制台窗口；若两者都找不到，ponte install 会直接报错并给出提示，
+# 而不是静默退回 python.exe 去弹窗。
+# pythonw_exe = "C:\\Python312\\pythonw.exe"
 # run_as = "user"    # 默认：登录后以当前用户运行，能读 ~/.ssh 密钥、免提权
 # run_as = "system"  # 开机即起（登录前就通）：以 SYSTEM 运行，需提权，且读不到用户密钥
 run_as = "user"

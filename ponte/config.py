@@ -222,10 +222,16 @@ class WindowsConfig:
     * ``"system"`` — boot-time task running as SYSTEM, surviving login/reboot,
       so the tunnel is up before anyone logs in; requires elevation and an
       identity file that SYSTEM can read (i.e. *not* ``~/.ssh``).
+
+    ``pythonw_exe`` pins the windowless interpreter the task runs. ponte refuses
+    to install a task that would fall back to ``python.exe`` (an interactive task
+    running a console program flashes a console window at every logon), so set
+    this only when ``pythonw.exe`` does not sit next to ``sys.executable``.
     """
 
     task_name: str = "SSH-Reverse-Tunnel"
     ssh_exe: str | None = None
+    pythonw_exe: str | None = None
     run_as: str = "user"
 
 
@@ -532,7 +538,7 @@ _KNOWN_RETRY = frozenset(
 _KNOWN_HEALTH = frozenset(
     {"check_interval", "remote_check_enabled", "remote_check_timeout", "max_check_interval"}
 )
-_KNOWN_WINDOWS = frozenset({"task_name", "ssh_exe", "run_as"})
+_KNOWN_WINDOWS = frozenset({"task_name", "ssh_exe", "pythonw_exe", "run_as"})
 _KNOWN_SERVICE = frozenset({"name", "autostart", "kill_timeout"})
 
 
@@ -692,6 +698,7 @@ def _parse_windows(section: Any, warnings: list[str] | None = None) -> WindowsCo
     dft = WindowsConfig()
     task_name = _optional_str(section, "task_name", default=dft.task_name)
     ssh_exe = _optional_str(section, "ssh_exe", default=None)
+    pythonw_exe = _optional_str(section, "pythonw_exe", default=None)
     run_as = _optional_str(section, "run_as", default=dft.run_as)
     if run_as not in ("system", "user"):
         raise ConfigValidationError(
@@ -700,6 +707,7 @@ def _parse_windows(section: Any, warnings: list[str] | None = None) -> WindowsCo
     return WindowsConfig(
         task_name=task_name,
         ssh_exe=_expand(ssh_exe) if ssh_exe else None,
+        pythonw_exe=_expand(pythonw_exe) if pythonw_exe else None,
         run_as=run_as or dft.run_as,
     )
 

@@ -132,10 +132,13 @@ Sections:
 - `[health]` — check interval, remote probe toggle/timeout,
   `max_check_interval` (backoff ceiling while unhealthy)
 - `[service]` — service name, autostart, POSIX kill grace
-- `[windows]` — Windows-only knobs (`task_name`, `ssh_exe`, `run_as`).
-  `run_as` is `user` (default: logon-time, runs as you, can read `~/.ssh`) or
-  `system` (boot-time, survives login/reboot, needs elevation **and** an
-  identity file SYSTEM can read).
+- `[windows]` — Windows-only knobs (`task_name`, `ssh_exe`, `pythonw_exe`,
+  `run_as`). `run_as` is `user` (default: logon-time, runs as you, can read
+  `~/.ssh`) or `system` (boot-time, survives login/reboot, needs elevation
+  **and** an identity file SYSTEM can read). `pythonw_exe` pins the windowless
+  interpreter the Scheduled Task runs: ponte refuses to install a task that
+  would fall back to `python.exe`, because that flashes a console window at
+  every logon.
 
 ## 🔍 Troubleshooting
 
@@ -144,6 +147,7 @@ Sections:
 | `Permission denied (publickey)` | public key on server `~/.ssh/authorized_keys`; on Windows strip inherited ACLs (`icacls id_rsa /inheritance:r /grant:r <user>:(R)`) |
 | Connection rejected after key change | delete `known_hosts`, reconnect (`StrictHostKeyChecking=accept-new` default) |
 | Process alive but remote port down | cloud security-group inbound rules; check server with `ss -tlnp` / `lsof -nP -iTCP -sTCP:LISTEN` — the daemon now force-reconnects a "zombie" tunnel after 3 consecutive failed checks |
+| Console window flashes at logon, or while stopping | the Scheduled Task must run `pythonw.exe` — check `[windows] pythonw_exe`; `ponte stop` also force-kills through a hidden `taskkill` |
 | Logs | `ponte logs -n 100 --follow` |
 
 ## 🧪 Development & testing
@@ -287,10 +291,11 @@ ponte（本地守护进程，Python）
 - `[health]` — 检查间隔、远程探测开关/超时、`max_check_interval`
   （不健康期间的间隔退避上限）
 - `[service]` — 服务名、自启、POSIX 强杀等待
-- `[windows]` — 仅 Windows 使用（`task_name`、`ssh_exe`、`run_as`）。
-  `run_as` 默认 `user`（登录后以你本人身份运行、能读 `~/.ssh`）或
+- `[windows]` — 仅 Windows 使用（`task_name`、`ssh_exe`、`pythonw_exe`、
+  `run_as`）。`run_as` 默认 `user`（登录后以你本人身份运行、能读 `~/.ssh`）或
   `system`（开机即起、重启也能拉起，但需提权，且 `identity_file`
-  必须是 SYSTEM 能读到的文件）。
+  必须是 SYSTEM 能读到的文件）。`pythonw_exe` 指定计划任务使用的无窗口解释器：
+  若只能回退到 `python.exe`，ponte 会拒绝安装——那会导致每次登录弹出黑色窗口。
 
 ## 🔍 排障
 
@@ -299,6 +304,7 @@ ponte（本地守护进程，Python）
 | 「Permission denied (publickey)」 | 公钥是否加入服务器 `~/.ssh/authorized_keys`；Windows 下私钥去掉继承 ACL（`icacls id_rsa /inheritance:r /grant:r <用户名>:(R)`） |
 | 换 key 后连接被拒 | 删除 `known_hosts` 重连（默认 `StrictHostKeyChecking=accept-new`） |
 | 进程活着但远程端口不通 | 云安全组入方向规则；服务器上 `ss -tlnp` / `lsof -nP -iTCP -sTCP:LISTEN` 确认监听 —— 守护进程已支持假死检测：连续 3 次检查失败自动强制重连 |
+| 登录时（或 `stop` 时）闪出黑色控制台窗口 | 计划任务必须跑 `pythonw.exe`——检查 `[windows] pythonw_exe`；`ponte stop` 的强杀也已隐藏控制台 |
 | 排查日志 | `ponte logs -n 100 --follow` |
 
 ## 🧪 开发与测试

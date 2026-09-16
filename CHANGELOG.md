@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A console window could still flash on the stop path.** Every external
+  control tool (`taskkill`, `systemctl`, `launchctl`) now goes through a single
+  helper that applies `creation_flags()`. `taskkill` was the Windows offender:
+  it ran bare, so `ponte stop` / `restart` popped a black console box while the
+  escalated kill ran — precisely when the user asked for a quiet stop.
+- **`ponte install` could silently register a popup-generating task.** When no
+  `pythonw.exe` sat next to `sys.executable`, the Scheduled Task quietly pointed
+  at `python.exe` and a console window appeared at every logon. Installation now
+  refuses with an actionable message instead of installing a task that pops up.
+
 ### Changed
 
 - **The PyPI distribution is `ponte-cli`.** The bare name `ponte` is already
@@ -20,6 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Publishing (OIDC, no stored token). It refuses a tag that does not match the
   version in `ponte/__init__.py`, and verifies the wheel's distribution name and
   contents (`config.example.toml`) before uploading.
+- `[windows] pythonw_exe` — pin the windowless interpreter for the Scheduled
+  Task, for installs where `pythonw.exe` does not sit next to `python.exe`.
 
 ### Planned
 
