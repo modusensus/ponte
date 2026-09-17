@@ -57,11 +57,23 @@ _STILL_ACTIVE = 259
 #: ``manager.connect()`` forever, leaving the tunnel down.
 _HEALTH_FAILURE_THRESHOLD = 3
 
+#: How many recent retry-loop events to keep in the status JSON event feed
+#: (rendered by ``ponte watch``, surfaced by ``ponte status``).
+_EVENT_FEED_LIMIT = 20
+
 
 def _derive_status_file(pid_file: str) -> str:
     """Derive the JSON status path from a ``.pid`` file path."""
     base, _ext = os.path.splitext(pid_file)
     return base + ".status.json"
+
+
+def _format_duration(seconds: float) -> str:
+    """Human readable duration, e.g. ``1h 2m 3s``."""
+    seconds = int(max(0.0, seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours}h {minutes}m {secs}s"
 
 
 def _derive_stop_marker(pid_file: str) -> str:
@@ -131,13 +143,61 @@ class DaemonStatus:
     health_error: str | None = None
     message: str = ""
 
+    # -- 隧道统计（cumulative; survives daemon restarts via the status file）--
+    #
+    # ``None`` 表示状态文件里没有这份统计（旧版本 daemon 写的文件）。
+
+    #: Every ``CONNECTING`` — each SSH launch attempt.
+    connect_attempts_total: int | None = None
+    #: Sessions that were actually established (``CONNECTED`` events).
+    sessions_total: int | None = None
+    #: Scheduled reconnects (``RETRYING`` events).
+    reconnects_total: int | None = None
+    #: Accumulated duration of *completed* sessions, seconds.
+    tunnel_uptime_seconds: float | None = None
+    #: Accumulated wall-clock gaps disconnect → next attempt, seconds.
+    tunnel_downtime_seconds: float | None = None
+    #: Wall-clock time the current session started (``None`` when disconnected).
+    current_session_at: float | None = None
+    #: Wall-clock time of the most recent disconnect.
+    last_disconnect_at: float | None = None
+    #: Human-readable reason of the most recent disconnect.
+    last_disconnect_reason: str | None = None
+    #: Bounded feed of recent retry-loop events (oldest first).
+    recent_events: list[dict] = dataclasses.field(default_factory=list)
+
     @property
     def uptime(self) -> str:
         """Human readable uptime, e.g. ``1h 2m 3s``."""
-        seconds = int(self.uptime_seconds)
-        hours, rem = divmod(seconds, 3600)
-        minutes, secs = divmod(rem, 60)
-        return f"{hours}h {minutes}m {secs}s"
+        return _format_duration(self.uptime_seconds)
+
+    @property
+    def session_uptime(self) -> str | None:
+        """Human-readable duration of the current session, ``None`` when down.
+
+        This is the number that exposes a "daemon alive but tunnel flapping"
+        situation: the process uptime looks fine while the session keeps
+        resetting to minutes.
+        """
+        if self.current_session_at is None:
+            return None
+        return _format_duration(time.time() - self.current_session_at)
+
+    @property
+    def availability(self) -> float | None:
+        """Fraction of observed time the tunnel has been up (0..1).
+
+        Based on the *completed* session/downtime bookkeeping; the ongoing
+        session's elapsed time is not yet counted, so a freshly reconnected
+        tunnel slightly understates availability. ``None`` when there is no
+        history at all.
+        """
+        up = self.tunnel_uptime_seconds or 0.0
+        down = self.tunnel_downtime_seconds or 0.0
+        total = up + down
+        if total <= 0:
+            return None
+        return up / total
 
 
 class TunnelDaemon:
@@ -156,6 +216,12 @@ class TunnelDaemon:
         self.stop_marker = _derive_stop_marker(self.pid_file)
         self._shutdown = threading.Event()
         self._last_health: HealthStatus | None = None
+        # Guards the status file's read-modify-write cycles: the health thread
+        # and the retry-event (main) thread both update the same JSON.
+        self._status_lock = threading.Lock()
+        # Wall-clock time of the most recent DISCONNECTED whose downtime has
+        # not yet been closed by a new connection attempt (in-memory only).
+        self._pending_disconnect_at: float | None = None
         # Consecutive unhealthy health checks observed by ``_on_health``. Used
         # to detect a "zombie" SSH process and force a reconnect (see
         # ``_HEALTH_FAILURE_THRESHOLD``).
@@ -258,18 +324,21 @@ class TunnelDaemon:
         still persisted and logged as usual.
         """
         self._last_health = status
-        data = self._read_status_json()
-        data.update(
-            {
-                "started_at": data.get("started_at", time.time()),
-                "checked_at": time.time(),
-                "process_alive": status.process_alive,
-                "healthy": status.all_healthy,
-                "remote_ports": {str(p): ok for p, ok in status.remote_ports.items()},
-                "health_error": status.error,
-            }
-        )
-        self._write_status_json(data)
+        with self._status_lock:
+            data = self._read_status_json()
+            data.update(
+                {
+                    "started_at": data.get("started_at", time.time()),
+                    "checked_at": time.time(),
+                    "process_alive": status.process_alive,
+                    "healthy": status.all_healthy,
+                    "remote_ports": {
+                        str(p): ok for p, ok in status.remote_ports.items()
+                    },
+                    "health_error": status.error,
+                }
+            )
+            self._write_status_json(data)
         health = logger.warning if not status.all_healthy else logger.debug
         health("health: %s", status)
 
@@ -297,6 +366,96 @@ class TunnelDaemon:
             # run of consecutive failures (avoids repeating every check).
             self._health_failures = 0
 
+    # -- Retry-loop statistics -------------------------------------------------
+
+    def _record_retry_event(self, event: RetryEvent, manager: TunnelManager) -> None:
+        """Fold a retry-loop event into the cumulative tunnel statistics.
+
+        Event semantics (see :mod:`ponte.retry`): ``CONNECTING`` fires *before*
+        the blocking ``connect()`` (session start), while ``CONNECTED`` and
+        ``DISCONNECTED`` both fire *after* the session has ended — so the
+        session duration is taken from ``manager.last_session_duration``
+        rather than from wall-clock deltas between events.
+
+        The counters are merged into the status JSON (read-modify-write under
+        the status lock) so they survive daemon restarts.
+        """
+        now = time.time()
+        reason: str | None = None
+        if event.type == RetryEvent.DISCONNECTED:
+            if event.error:
+                reason = event.error
+            elif event.exit_code is not None:
+                reason = f"ssh exited with code {event.exit_code}"
+            else:
+                reason = "unknown"
+
+        with self._status_lock:
+            data = self._read_status_json()
+            data["started_at"] = data.get("started_at", now)
+            attempts = int(data.get("connect_attempts_total", 0))
+            sessions = int(data.get("sessions_total", 0))
+            reconnects = int(data.get("reconnects_total", 0))
+            uptime_total = float(data.get("tunnel_uptime_seconds", 0.0))
+            downtime_total = float(data.get("tunnel_downtime_seconds", 0.0))
+            feed = list(data.get("recent_events", []))
+
+            if event.type == RetryEvent.CONNECTING:
+                attempts += 1
+                # Close the previous downtime gap (disconnect → this attempt).
+                pending = self._pending_disconnect_at
+                if pending is not None:
+                    downtime_total += max(0.0, now - pending)
+                    self._pending_disconnect_at = None
+            elif event.type == RetryEvent.CONNECTED:
+                sessions += 1
+            elif event.type == RetryEvent.DISCONNECTED:
+                duration = getattr(manager, "last_session_duration", None)
+                if duration is not None:
+                    uptime_total += max(0.0, float(duration))
+                self._pending_disconnect_at = now
+            elif event.type == RetryEvent.RETRYING:
+                reconnects += 1
+
+            entry = {
+                "at": now,
+                "type": event.type,
+            }
+            if event.type == RetryEvent.DISCONNECTED:
+                entry["reason"] = reason or "unknown"
+                if event.exit_code is not None:
+                    entry["exit_code"] = event.exit_code
+            elif event.type == RetryEvent.RETRYING:
+                entry["attempt"] = event.attempt
+                entry["delay"] = round(event.delay, 3)
+            feed.append(entry)
+            del feed[:-_EVENT_FEED_LIMIT]
+
+            data.update(
+                {
+                    "connect_attempts_total": attempts,
+                    "sessions_total": sessions,
+                    "reconnects_total": reconnects,
+                    "tunnel_uptime_seconds": uptime_total,
+                    "tunnel_downtime_seconds": downtime_total,
+                    "current_session_at": now
+                    if event.type == RetryEvent.CONNECTING
+                    else (
+                        None
+                        if event.type == RetryEvent.DISCONNECTED
+                        else data.get("current_session_at")
+                    ),
+                    "last_disconnect_at": now
+                    if event.type == RetryEvent.DISCONNECTED
+                    else data.get("last_disconnect_at"),
+                    "last_disconnect_reason": reason
+                    if event.type == RetryEvent.DISCONNECTED
+                    else data.get("last_disconnect_reason"),
+                    "recent_events": feed,
+                }
+            )
+            self._write_status_json(data)
+
     # -- Foreground loop -------------------------------------------------------
 
     def run(self) -> int:
@@ -320,7 +479,18 @@ class TunnelDaemon:
         health = HealthChecker(manager, self.config.health)
 
         # Prime the status file with a start time before the first health tick.
-        self._write_status_json({"started_at": time.time()})
+        # Merge, don't overwrite: the cumulative tunnel statistics below must
+        # survive daemon restarts (systemd / the Scheduled Task respawn the
+        # process on crash, and the user cares about the tunnel's history).
+        with self._status_lock:
+            data = self._read_status_json()
+            data["started_at"] = time.time()
+            for key in ("connect_attempts_total", "sessions_total", "reconnects_total"):
+                data.setdefault(key, 0)
+            for key in ("tunnel_uptime_seconds", "tunnel_downtime_seconds"):
+                data.setdefault(key, 0.0)
+            data.setdefault("recent_events", [])
+            self._write_status_json(data)
 
         def request_stop(reason: str) -> None:
             """Request shutdown from any thread. Idempotent, never raises."""
@@ -358,6 +528,7 @@ class TunnelDaemon:
         )
         try:
             for event in runner.run(manager):
+                self._record_retry_event(event, manager)
                 if event.type == RetryEvent.CONNECTING:
                     log.debug("connecting to %s ...", self.config.ssh.destination)
                 elif event.type == RetryEvent.CONNECTED:
@@ -550,6 +721,13 @@ class TunnelDaemon:
         info = self._read_status_json()
         started = info.get("started_at")
         uptime = (time.time() - float(started)) if started else 0.0
+        current_session_at = info.get("current_session_at")
+        last_disconnect_at = info.get("last_disconnect_at")
+        attempts_raw = info.get("connect_attempts_total")
+        sessions_raw = info.get("sessions_total")
+        reconnects_raw = info.get("reconnects_total")
+        uptime_raw = info.get("tunnel_uptime_seconds")
+        downtime_raw = info.get("tunnel_downtime_seconds")
         return DaemonStatus(
             running=True,
             pid=pid,
@@ -560,6 +738,23 @@ class TunnelDaemon:
                 int(p): bool(ok) for p, ok in dict(info.get("remote_ports", {})).items()
             },
             health_error=info.get("health_error"),
+            connect_attempts_total=int(attempts_raw) if attempts_raw is not None else None,
+            sessions_total=int(sessions_raw) if sessions_raw is not None else None,
+            reconnects_total=int(reconnects_raw) if reconnects_raw is not None else None,
+            tunnel_uptime_seconds=float(uptime_raw) if uptime_raw is not None else None,
+            tunnel_downtime_seconds=(
+                float(downtime_raw) if downtime_raw is not None else None
+            ),
+            current_session_at=(
+                float(current_session_at) if current_session_at is not None else None
+            ),
+            last_disconnect_at=(
+                float(last_disconnect_at) if last_disconnect_at is not None else None
+            ),
+            last_disconnect_reason=info.get("last_disconnect_reason"),
+            recent_events=[
+                dict(e) for e in info.get("recent_events", []) if isinstance(e, dict)
+            ],
         )
 
     # -- Diagnostics -----------------------------------------------------------

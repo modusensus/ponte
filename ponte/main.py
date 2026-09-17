@@ -10,6 +10,7 @@ Typical usage::
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -17,12 +18,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
 import typer
-from rich.console import Console
+from rich.console import Console, RenderableType
+from rich.live import Live
 from rich.markup import escape
+from rich.panel import Panel
 from rich.table import Table
 
 from ponte import __version__
 from ponte.config import ConfigError, get_config, init_config, set_config_path
+from ponte.daemon import _format_duration
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard, runtime import is lazy
     from ponte.daemon import TunnelDaemon
@@ -201,13 +205,58 @@ def restart() -> None:
 
 
 @app.command()
-def status() -> None:
+def status(
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="以 JSON 输出（供脚本 / 监控系统消费）",
+    ),
+) -> None:
     """查看守护进程与隧道健康状态。"""
     try:
         s = _daemon().status()
         if not s.running:
-            console.print("[grey]未运行（可 ponte start 启动）[/grey]")
+            if json_output:
+                console.print_json(json.dumps({"running": False}))
+            else:
+                console.print("[grey]未运行（可 ponte start 启动）[/grey]")
             raise typer.Exit(code=0)
+
+        if json_output:
+            console.print_json(
+                json.dumps(
+                    {
+                        "running": True,
+                        "pid": s.pid,
+                        "started_at": s.started_at,
+                        "uptime_seconds": round(s.uptime_seconds, 1),
+                        "healthy": s.healthy,
+                        "health_error": s.health_error,
+                        "remote_ports": {
+                            str(p): ok for p, ok in s.remote_ports.items()
+                        },
+                        "connect_attempts_total": s.connect_attempts_total,
+                        "sessions_total": s.sessions_total,
+                        "reconnects_total": s.reconnects_total,
+                        "tunnel_uptime_seconds": (
+                            round(s.tunnel_uptime_seconds, 1)
+                            if s.tunnel_uptime_seconds is not None
+                            else None
+                        ),
+                        "tunnel_downtime_seconds": (
+                            round(s.tunnel_downtime_seconds, 1)
+                            if s.tunnel_downtime_seconds is not None
+                            else None
+                        ),
+                        "current_session_at": s.current_session_at,
+                        "last_disconnect_at": s.last_disconnect_at,
+                        "last_disconnect_reason": s.last_disconnect_reason,
+                        "recent_events": s.recent_events,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return
 
         table = Table(title="ponte 状态", header_style="bold cyan")
         table.add_column("项目", no_wrap=True, style="cyan")
@@ -229,6 +278,18 @@ def status() -> None:
             for port in sorted(s.remote_ports):
                 mark = "[green]监听中[/green]" if s.remote_ports[port] else "[red]未监听[/red]"
                 table.add_row(f"远程端口 {port}", mark)
+
+        # 隧道统计：区分“守护进程活了多久”和“隧道活了多久”，暴露反复断线。
+        if s.current_session_at is not None:
+            session_uptime = _format_duration(time.time() - s.current_session_at)
+            table.add_row("当前会话时长", session_uptime)
+        if s.sessions_total is not None:
+            stats = (
+                f"会话 {s.sessions_total} 次 · 重连 {s.reconnects_total} 次"
+            )
+            if s.last_disconnect_reason:
+                stats += f" · 上次断线：{s.last_disconnect_reason}"
+            table.add_row("隧道统计", escape(stats))
         if s.message:
             table.add_row("备注", escape(s.message))
 
@@ -288,6 +349,120 @@ def logs(
         except KeyboardInterrupt:
             console.print("\n[yellow]已停止跟随[/yellow]")
             raise typer.Exit(code=0) from None
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        _fail(str(exc))
+
+
+# ---------------------------------------------------------------------------
+# watch（实时看板）
+# ---------------------------------------------------------------------------
+
+
+def _render_watch(s) -> RenderableType:  # noqa: ANN001 - DaemonStatus cycle guard
+    """Render one dashboard frame from a :class:`~ponte.daemon.DaemonStatus`."""
+    if not s.running:
+        grid = Table.grid(padding=(0, 2))
+        grid.add_row("[red]守护进程未运行[/red]（可 ponte start 启动）")
+        return Panel.fit(grid, title="ponte watch", border_style="red")
+
+    table = Table.grid(padding=(0, 2))
+    table.add_row("PID", str(s.pid))
+    table.add_row("守护进程运行时长", s.uptime)
+
+    if s.healthy is True:
+        health_markup = "[green]健康[/green]"
+    elif s.healthy is None:
+        health_markup = "[yellow]未知[/yellow]"
+    else:
+        detail = escape(s.health_error or "")
+        health_markup = "[red]异常[/red]" + (f"（{detail}）" if detail else "")
+    table.add_row("健康状态", health_markup)
+
+    if s.current_session_at is not None:
+        session_up = _format_duration(time.time() - s.current_session_at)
+        table.add_row("当前会话", session_up)
+    else:
+        table.add_row("当前会话", "[red]已断开[/red]")
+
+    if s.sessions_total is not None:
+        avail = "—"
+        up = s.tunnel_uptime_seconds or 0.0
+        down = s.tunnel_downtime_seconds or 0.0
+        if up + down > 0:
+            avail = f"{(up / (up + down)) * 100:.1f}%"
+        table.add_row(
+            "会话统计",
+            f"会话 {s.sessions_total} · 重连 {s.reconnects_total} · 在线率 {avail}",
+        )
+
+    for port in sorted(s.remote_ports):
+        mark = (
+            "[green]监听中[/green]" if s.remote_ports[port] else "[red]未监听[/red]"
+        )
+        table.add_row(f"远程端口 {port}", mark)
+
+    if s.last_disconnect_reason:
+        since = ""
+        if s.last_disconnect_at is not None:
+            since = f"（{_format_duration(time.time() - s.last_disconnect_at)}前）"
+        table.add_row("上次断线", escape(s.last_disconnect_reason) + since)
+
+    feed = Table(
+        title="最近事件",
+        title_style="dim",
+        show_header=False,
+        padding=(0, 1),
+    )
+    feed.add_column(style="dim", no_wrap=True)
+    feed.add_column()
+    for e in reversed(s.recent_events[-8:]):
+        etype = str(e.get("type", "?"))
+        icon = {
+            "connecting": "[dim]→[/dim]",
+            "connected": "[green]●[/green]",
+            "disconnected": "[red]●[/red]",
+            "retrying": "[yellow]↻[/yellow]",
+            "max_retries_reached": "[red]✗[/red]",
+        }.get(etype, "·")
+        stamp = time.strftime("%H:%M:%S", time.localtime(e.get("at", 0)))
+        text = etype
+        if e.get("reason"):
+            text = f"{etype}: {e['reason']}"
+        elif e.get("attempt"):
+            text = f"{etype}: 第 {e['attempt']} 次，{e.get('delay', 0):.1f}s 后重试"
+        feed.add_row(f"{stamp}", f"{icon} {escape(text)}")
+
+    body = Table.grid()
+    body.add_row(Panel.fit(table, title="ponte 状态", border_style="cyan"))
+    body.add_row(feed)
+    return Panel(
+        body,
+        title=f"ponte watch — pid {s.pid}",
+        border_style="green" if s.healthy else "yellow",
+    )
+
+
+@app.command()
+def watch(
+    interval: float = typer.Option(
+        2.0, "--interval", min=0.5, help="刷新间隔（秒）"
+    ),
+) -> None:
+    """实时看板：在终端里持续刷新隧道健康与会话统计。"""
+    daemon = _daemon()
+    try:
+        with Live(
+            _render_watch(daemon.status()),
+            console=console,
+            refresh_per_second=2,
+        ) as live:
+            while True:
+                time.sleep(interval)
+                live.update(_render_watch(daemon.status()))
+    except KeyboardInterrupt:
+        raise typer.Exit(code=0) from None
     except typer.Exit:
         raise
     except Exception as exc:

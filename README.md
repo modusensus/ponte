@@ -63,7 +63,8 @@ import package stay `ponte`; a checkout installs the same way (`pipx install .`)
 | `init [--path P] [--force]` | write a config file from the template (never overwrites without `--force`) |
 | `start` / `start --foreground` | start daemon in background / foreground (debug) |
 | `stop` / `restart` | graceful stop / stop-then-start |
-| `status` | local process + remote port + service state |
+| `status [--json]` | local process + remote port + tunnel statistics (`--json` for scripts) |
+| `watch [--interval S]` | live dashboard: health, session uptime, reconnects, event feed |
 | `logs [-n N] [--follow]` | view / tail the daemon log |
 | `test` | quick SSH connectivity check |
 | `check` | verify configured remote ports are listening |
@@ -225,7 +226,8 @@ ponte install           # 注册开机自启 + 崩溃重启
 | `init [--path P] [--force]` | 从模板生成配置文件（不加 `--force` 不覆盖） |
 | `start` / `start --foreground` | 后台启动 / 前台启动（调试） |
 | `stop` / `restart` | 优雅停止 / 停旧起新 |
-| `status` | 本地进程 + 远程端口 + 服务状态 |
+| `status [--json]` | 本地进程 + 远程端口 + 隧道统计（`--json` 供脚本消费） |
+| `watch [--interval S]` | 实时看板：健康、会话时长、重连次数与事件流 |
 | `logs [-n N] [--follow]` | 查看 / 跟读日志 |
 | `test` | 快速测 SSH 连通性 |
 | `check` | 检查各远程端口是否在监听 |

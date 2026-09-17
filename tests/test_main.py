@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import time
 
 from typer.testing import CliRunner
 
@@ -97,6 +98,125 @@ def test_status_not_running(monkeypatch) -> None:
     result = CliRunner().invoke(app, ["status"])
     assert result.exit_code == 0
     assert "未运行" in result.output
+
+
+def test_status_json_not_running(monkeypatch) -> None:
+    import json as _json
+
+    monkeypatch.setattr(
+        "ponte.main._daemon", lambda: _FakeDaemon(running=False)
+    )
+    result = CliRunner().invoke(app, ["status", "--json"])
+    assert result.exit_code == 0
+    payload = _json.loads(result.output)
+    assert payload == {"running": False}
+
+
+def test_status_json_running(monkeypatch) -> None:
+    """--json 输出机器可读统计（脚本/监控消费的契约）。"""
+    import json as _json
+
+    s = DaemonStatus(
+        running=True,
+        pid=4321,
+        started_at=1000.0,
+        uptime_seconds=60.0,
+        healthy=True,
+        remote_ports={23334: True},
+        connect_attempts_total=5,
+        sessions_total=4,
+        reconnects_total=3,
+        tunnel_uptime_seconds=400.0,
+        tunnel_downtime_seconds=100.0,
+        current_session_at=1000.0,
+        last_disconnect_at=900.0,
+        last_disconnect_reason="ssh exited with code 255",
+        recent_events=[{"at": 900.0, "type": "disconnected", "reason": "x"}],
+    )
+
+    class _Daemon:
+        def status(self) -> DaemonStatus:
+            return s
+
+    monkeypatch.setattr("ponte.main._daemon", lambda: _Daemon())
+    result = CliRunner().invoke(app, ["status", "--json"])
+    assert result.exit_code == 0
+    payload = _json.loads(result.output)
+    assert payload["running"] is True
+    assert payload["pid"] == 4321
+    assert payload["healthy"] is True
+    assert payload["remote_ports"] == {"23334": True}
+    assert payload["sessions_total"] == 4
+    assert payload["reconnects_total"] == 3
+    assert payload["tunnel_uptime_seconds"] == 400.0
+    assert payload["last_disconnect_reason"] == "ssh exited with code 255"
+    assert payload["recent_events"][0]["type"] == "disconnected"
+
+
+def test_status_table_shows_tunnel_stats(monkeypatch) -> None:
+    """默认表格输出包含会话统计与上次断线原因（信息缺口修复）。"""
+    s = DaemonStatus(
+        running=True,
+        pid=1234,
+        uptime_seconds=3600.0,
+        healthy=True,
+        remote_ports={23334: True},
+        sessions_total=4,
+        reconnects_total=3,
+        current_session_at=time.time() - 120,
+        last_disconnect_reason="ssh exited with code 255",
+    )
+
+    class _Daemon:
+        def status(self) -> DaemonStatus:
+            return s
+
+    monkeypatch.setattr("ponte.main._daemon", lambda: _Daemon())
+    result = CliRunner().invoke(app, ["status"])
+    assert result.exit_code == 0
+    assert "会话 4 次" in result.output
+    assert "重连 3 次" in result.output
+    assert "ssh exited with code 255" in result.output
+
+
+def test_watch_renders_dashboard(monkeypatch) -> None:
+    """watch 看板：一帧渲染包含健康、会话与事件流（不进入死循环）。"""
+    from ponte.main import _render_watch, console
+
+    s = DaemonStatus(
+        running=True,
+        pid=1234,
+        uptime_seconds=3600.0,
+        healthy=True,
+        remote_ports={23334: True},
+        sessions_total=2,
+        reconnects_total=1,
+        tunnel_uptime_seconds=300.0,
+        tunnel_downtime_seconds=30.0,
+        current_session_at=time.time() - 60,
+        last_disconnect_reason="connection reset",
+        recent_events=[
+            {"at": time.time(), "type": "connected"},
+            {
+                "at": time.time(),
+                "type": "disconnected",
+                "reason": "connection reset",
+            },
+            {"at": time.time(), "type": "retrying", "attempt": 1, "delay": 2.0},
+        ],
+    )
+    with console.capture() as capture:
+        console.print(_render_watch(s))
+    text = capture.get()
+    assert "会话统计" in text
+    assert "最近事件" in text
+    assert "connection reset" in text
+    assert "在线率" in text
+
+    # 未运行时的渲染分支。
+    with console.capture() as capture:
+        console.print(_render_watch(DaemonStatus(running=False)))
+    assert "未运行" in capture.get()
 
 
 def test_logs_no_file(monkeypatch) -> None:
