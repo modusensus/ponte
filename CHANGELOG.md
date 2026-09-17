@@ -28,6 +28,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Tunnel statistics that separate "daemon alive" from "tunnel up".** The
+  status file now carries cumulative counters — connection attempts,
+  established sessions, scheduled reconnects, accumulated tunnel uptime and
+  downtime, the current session's start time, and the last disconnect with
+  its reason and timestamp. The counters survive daemon restarts (merged,
+  not overwritten, when the service manager respawns the process), so a
+  tunnel that flaps for hours no longer hides behind a healthy process
+  uptime. `ponte status` shows the current session duration, session/reconnect
+  counts and the last disconnect reason; `ponte status --json` emits the full
+  snapshot for scripts and monitoring.
+- **`ponte watch` — a live terminal dashboard.** A `rich.Live` view that
+  refreshes in place: process health, current session duration, session
+  statistics with availability, remote-port states, the last disconnect and a
+  bounded feed of the most recent retry-loop events.
 - `.github/workflows/publish.yml` — tag-triggered publishing to PyPI via Trusted
   Publishing (OIDC, no stored token). It refuses a tag that does not match the
   version in `ponte/__init__.py`, and verifies the wheel's distribution name and

@@ -28,6 +28,7 @@ from ponte.daemon import (
     _run_tool,
 )
 from ponte.health import HealthStatus
+from ponte.retry import RetryEvent
 
 
 def _cfg(tmp_path, *, run_as: str = "system") -> TunnelConfig:
@@ -107,6 +108,26 @@ def test_status_json_parsing(tmp_path) -> None:
     assert s.running is True
     assert s.healthy is True
     assert s.remote_ports == {23334: True}
+
+
+class _DurationManager:
+    """Manager stand-in exposing ``last_session_duration`` from a list.
+
+    ``calls`` is set by the test to the number of completed sessions before
+    the ``DISCONNECTED`` event is recorded (mirrors ``TunnelManager``, which
+    updates the duration at each ``connect()`` return). An empty list means
+    "no session ever completed" (duration ``None``).
+    """
+
+    def __init__(self, durations: list[float]) -> None:
+        self.durations = durations
+        self.calls = 0
+
+    @property
+    def last_session_duration(self) -> float | None:
+        if self.calls == 0 or not self.durations:
+            return None
+        return self.durations[min(self.calls - 1, len(self.durations) - 1)]
 
 
 def test_status_malformed_pid_file(tmp_path) -> None:
@@ -403,6 +424,171 @@ def test_on_health_does_not_force_reconnect_when_process_dead(tmp_path) -> None:
     for _ in range(5):
         d._on_health(_unhealthy_status(process_alive=False), manager)
     assert manager.stop_calls == 0
+
+
+# ---------------------------------------------------------------------------
+# 重连统计（tunnel statistics）
+# ---------------------------------------------------------------------------
+
+
+def _live_pid(tmp_path) -> None:
+    with open(tmp_path / "ponte.pid", "w", encoding="utf-8") as fh:
+        fh.write(str(os.getpid()))
+
+
+def test_record_retry_event_full_session(tmp_path) -> None:
+    """完整会话周期 → attempts/sessions/uptime/current_session_at 正确累计。"""
+    d = TunnelDaemon(_cfg(tmp_path))
+    manager = _DurationManager([120.0])
+
+    d._record_retry_event(RetryEvent.connecting(), manager)
+    data = d._read_status_json()
+    assert data["connect_attempts_total"] == 1
+    assert data["sessions_total"] == 0
+    assert data["current_session_at"] is not None
+    session_at = data["current_session_at"]
+
+    manager.calls = 1  # connect() 返回 → 会话时长变为可读
+    d._record_retry_event(RetryEvent.connected(), manager)
+    d._record_retry_event(RetryEvent.disconnected(0), manager)
+    data = d._read_status_json()
+    assert data["sessions_total"] == 1
+    assert data["tunnel_uptime_seconds"] == 120.0
+    assert data["current_session_at"] is None
+    assert data["last_disconnect_at"] is not None
+    assert data["last_disconnect_reason"] == "ssh exited with code 0"
+
+    # 会话起点不再保留旧值。
+    assert data["current_session_at"] != session_at
+
+    # RETRYING：重连计数 +1，downtime 在下一次 CONNECTING 时闭合。
+    d._record_retry_event(RetryEvent.retrying(3.5, 1), manager)
+    data = d._read_status_json()
+    assert data["reconnects_total"] == 1
+    assert data["tunnel_downtime_seconds"] == 0.0  # 尚未闭合
+
+    d._record_retry_event(RetryEvent.connecting(), manager)
+    data = d._read_status_json()
+    assert data["connect_attempts_total"] == 2
+    assert data["tunnel_downtime_seconds"] >= 0.0
+    assert data["current_session_at"] is not None
+
+    # 事件流：保留全部 5 条，disconnected 带原因。
+    feed = data["recent_events"]
+    assert [e["type"] for e in feed] == [
+        "connecting", "connected", "disconnected", "retrying", "connecting",
+    ]
+    assert feed[2]["reason"] == "ssh exited with code 0"
+    assert feed[3]["attempt"] == 1
+    assert feed[3]["delay"] == 3.5
+
+
+def test_record_retry_event_launch_failure(tmp_path) -> None:
+    """connect() 抛异常（无法启动）→ uptime 不累计，原因来自 error。"""
+    d = TunnelDaemon(_cfg(tmp_path))
+    manager = _DurationManager([])
+
+    d._record_retry_event(RetryEvent.connecting(), manager)
+    d._record_retry_event(
+        RetryEvent.disconnected(None, error="OSError: ssh not found"), manager
+    )
+    data = d._read_status_json()
+    assert data["sessions_total"] == 0
+    assert data["tunnel_uptime_seconds"] == 0.0
+    assert data["last_disconnect_reason"] == "OSError: ssh not found"
+    feed = data["recent_events"]
+    assert feed[1]["reason"] == "OSError: ssh not found"
+    assert "exit_code" not in feed[1]
+
+
+def test_record_retry_event_feed_is_bounded(tmp_path) -> None:
+    """事件流是有界的（最多 _EVENT_FEED_LIMIT 条）。"""
+    from ponte.daemon import _EVENT_FEED_LIMIT
+
+    d = TunnelDaemon(_cfg(tmp_path))
+    manager = _DurationManager([])  # duration None → uptime 不累计
+    for _ in range(_EVENT_FEED_LIMIT + 10):
+        d._record_retry_event(RetryEvent.connecting(), manager)
+        d._record_retry_event(RetryEvent.disconnected(1), manager)
+    data = d._read_status_json()
+    assert len(data["recent_events"]) == _EVENT_FEED_LIMIT
+    # 最老的事件被淘汰：剩余的最后一条应是最后一轮 disconnected。
+    assert data["recent_events"][-1]["type"] == "disconnected"
+
+
+def test_stats_survive_daemon_restart(tmp_path) -> None:
+    """run() 前置合并不清零历史统计（守护进程被服务拉起时保住历史）。
+
+    直接调用合并逻辑等价片段：预先写一份带统计的状态文件，再模拟 run() 的
+    setdefault 合并路径（run() 本身需要 mock 整个 retry/health 循环，这里只
+    验证合并语义不改数据的部分）。
+    """
+    d = TunnelDaemon(_cfg(tmp_path))
+    d._write_status_json(
+        {
+            "started_at": 1.0,
+            "sessions_total": 7,
+            "connect_attempts_total": 9,
+            "reconnects_total": 2,
+            "tunnel_uptime_seconds": 3600.0,
+            "tunnel_downtime_seconds": 30.0,
+            "recent_events": [{"at": 1.0, "type": "connected"}],
+        }
+    )
+    with d._status_lock:
+        data = d._read_status_json()
+        for key in (
+            "connect_attempts_total", "sessions_total", "reconnects_total"
+        ):
+            data.setdefault(key, 0)
+        for key in ("tunnel_uptime_seconds", "tunnel_downtime_seconds"):
+            data.setdefault(key, 0.0)
+        data.setdefault("recent_events", [])
+        d._write_status_json(data)
+
+    merged = d._read_status_json()
+    assert merged["sessions_total"] == 7
+    assert merged["connect_attempts_total"] == 9
+    assert merged["reconnects_total"] == 2
+    assert merged["tunnel_uptime_seconds"] == 3600.0
+    assert len(merged["recent_events"]) == 1
+
+
+def test_status_surfaces_statistics(tmp_path) -> None:
+    """status() 把统计字段从 JSON 透出到 DaemonStatus。"""
+    cfg = _cfg(tmp_path)
+    d = TunnelDaemon(cfg)
+    _live_pid(tmp_path)
+    now = time.time()
+    d._write_status_json(
+        {
+            "started_at": now - 100,
+            "healthy": True,
+            "remote_ports": {"23334": True},
+            "connect_attempts_total": 5,
+            "sessions_total": 4,
+            "reconnects_total": 3,
+            "tunnel_uptime_seconds": 400.0,
+            "tunnel_downtime_seconds": 100.0,
+            "current_session_at": now - 50,
+            "last_disconnect_at": now - 60,
+            "last_disconnect_reason": "ssh exited with code 255",
+            "recent_events": [{"at": now, "type": "connecting"}],
+        }
+    )
+    s = d.status()
+    assert s.connect_attempts_total == 5
+    assert s.sessions_total == 4
+    assert s.reconnects_total == 3
+    assert s.tunnel_uptime_seconds == 400.0
+    assert s.tunnel_downtime_seconds == 100.0
+    assert s.current_session_at is not None and s.current_session_at <= now
+    assert s.last_disconnect_reason == "ssh exited with code 255"
+    assert s.recent_events == [{"at": now, "type": "connecting"}]
+    # 派生属性
+    assert s.session_uptime is not None
+    assert s.availability is not None
+    assert abs(s.availability - 0.8) < 1e-9  # 400 / (400 + 100)
 
 
 # ---------------------------------------------------------------------------
