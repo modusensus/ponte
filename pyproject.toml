@@ -75,7 +75,7 @@ show_missing = true
 skip_covered = true
 # 阈值：低于此值 CI 视为失败，防止覆盖率回退。
 # 当前实测约 79%（Windows），跨平台留出余量；目标见 CHANGELOG 的 80% 计划。
-fail_under = 70
+fail_under = 80
 
 [tool.ruff]
 line-length = 100

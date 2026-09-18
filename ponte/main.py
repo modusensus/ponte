@@ -27,6 +27,7 @@ from rich.table import Table
 from ponte import __version__
 from ponte.config import ConfigError, get_config, init_config, set_config_path
 from ponte.daemon import _format_duration
+from ponte.doctor import FAIL, OK, SKIP, WARN, counts, run_checks
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard, runtime import is lazy
     from ponte.daemon import TunnelDaemon
@@ -307,6 +308,9 @@ def _add_profile_rows(table: Table, profile) -> None:  # noqa: ANN001 - cycle gu
     for port, ok in sorted(profile.local_ports.items()):
         table.add_row(f"本地端口 {port}", _markup_port(ok))
 
+    if profile.last_notification_at is not None:
+        ago = _format_duration(time.time() - profile.last_notification_at)
+        table.add_row("上次通知", f"{ago}前")
     if profile.error:
         table.add_row("错误", f"[red]{escape(profile.error)}[/red]")
 
@@ -334,6 +338,7 @@ def _profile_payload(profile) -> dict:  # noqa: ANN001 - ProfileStatus cycle gua
         "current_session_at": profile.current_session_at,
         "last_disconnect_at": profile.last_disconnect_at,
         "last_disconnect_reason": profile.last_disconnect_reason,
+        "last_notification_at": profile.last_notification_at,
         "recent_events": profile.recent_events,
     }
 
@@ -481,6 +486,11 @@ def _render_profile_watch(profile) -> RenderableType:  # noqa: ANN001 - cycle gu
             since = f"（{_format_duration(time.time() - profile.last_disconnect_at)}前）"
         table.add_row("上次断线", escape(profile.last_disconnect_reason) + since)
 
+    if profile.last_notification_at is not None:
+        table.add_row(
+            "上次通知", f"{_format_duration(time.time() - profile.last_notification_at)}前"
+        )
+
     if profile.error:
         table.add_row("错误", f"[red]{escape(profile.error)}[/red]")
 
@@ -614,6 +624,88 @@ def check(
 
 
 @app.command()
+def doctor(
+    offline: bool = typer.Option(False, "--offline", help="跳过需要网络/SSH 的检查"),
+    timeout: int = typer.Option(5, "--timeout", help="SSH 连通性测试超时（秒）"),
+) -> None:
+    """一键体检：配置、密钥、连通性、端口、自启与通知，逐项给结论与修法。"""
+    try:
+        cfg = get_config()
+    except ConfigError as exc:
+        # 配置本身坏掉时，doctor 的价值就是直接把原因和修法说清楚，
+        # 而不是抛异常让用户回去自己猜。
+        console.print(Panel(escape(str(exc)), title="ponte doctor", border_style="red"))
+        console.print("[dim]修好配置后重新运行 ponte doctor[/dim]")
+        raise typer.Exit(code=1) from None
+
+    try:
+        daemon = _daemon()
+    except Exception:  # noqa: BLE001 - 其余检查仍然有价值
+        daemon = None
+
+    checks = run_checks(cfg, daemon, offline=offline, timeout=timeout)
+    table = Table(title="ponte doctor", header_style="bold cyan")
+    table.add_column("检查", no_wrap=True, style="cyan")
+    table.add_column("结论", no_wrap=True)
+    table.add_column("详情")
+    table.add_column("建议", style="dim")
+    marks = {
+        OK: "[green]✔ 通过[/green]",
+        WARN: "[yellow]! 注意[/yellow]",
+        FAIL: "[red]✘ 失败[/red]",
+        SKIP: "[dim]– 跳过[/dim]",
+    }
+    for check in checks:
+        table.add_row(
+            escape(check.name),
+            marks.get(check.status, check.status),
+            escape(check.detail),
+            escape(check.hint),
+        )
+    console.print(table)
+
+    tally = counts(checks)
+    console.print(
+        f"通过 {tally[OK]} · 注意 {tally[WARN]} · "
+        f"失败 {tally[FAIL]} · 跳过 {tally[SKIP]}"
+    )
+    if tally[FAIL]:
+        raise typer.Exit(code=1)
+
+
+@app.command("notify-test")
+def notify_test(
+    profile: str | None = typer.Option(
+        None, "--profile", "-P", help="测试消息里显示的名字"
+    ),
+) -> None:
+    """发一条测试通知，验证 ntfy / webhook 配置真的能收到。"""
+    from ponte.notify import Notifier
+
+    try:
+        cfg = get_config()
+        if not cfg.notify.enabled:
+            _fail("[notify] enabled = false：先启用它再测试")
+        if not cfg.notify.channels:
+            _fail("[notify] 没有配置任何通道（ntfy_topic 或 webhook_url）")
+
+        notifier = Notifier(cfg.notify)
+        name = profile or (cfg.profile_names[0] if cfg.profile_names else "test")
+        results = notifier.send_test(profile=name, destination="（测试消息）")
+        for channel, delivered in results.items():
+            mark = "[green]已发送[/green]" if delivered else "[red]发送失败[/red]"
+            console.print(f"{channel}：{mark}")
+        if notifier.last_error:
+            console.print(f"[yellow]{escape(notifier.last_error)}[/yellow]")
+        if not all(results.values()):
+            raise typer.Exit(code=1)
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        _fail(str(exc))
+
+
+@app.command()
 def install() -> None:
     """注册开机自启 + 崩溃重启（按平台：计划任务 / systemd / launchd）。"""
     try:
@@ -680,6 +772,14 @@ def config() -> None:
             f"remote_check={'on' if health.remote_check_enabled else 'off'}, "
             f"remote_check_timeout={health.remote_check_timeout}s, "
             f"max_check_interval={health.max_check_interval}s",
+        )
+        notify = cfg.notify
+        table.add_row(
+            "notify",
+            f"enabled={'on' if notify.enabled else 'off'}, "
+            f"channels={', '.join(notify.channels) or '（无）'}, "
+            f"on_consecutive_failures={notify.on_consecutive_failures}, "
+            f"cooldown={notify.cooldown}s",
         )
         table.add_row("pid_file", cfg.daemon.pid_file or "（默认）")
         table.add_row("log_file", cfg.daemon.log_file or "（默认）")

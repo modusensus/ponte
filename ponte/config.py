@@ -47,6 +47,7 @@ __all__ = [
     "Profile",
     "DEFAULT_PROFILE_NAME",
     "DaemonConfig",
+    "NotifyConfig",
     "RetryConfig",
     "HealthConfig",
     "WindowsConfig",
@@ -322,6 +323,41 @@ class HealthConfig:
 
 
 @dataclass(frozen=True)
+class NotifyConfig:
+    """Out-of-band alerts when a tunnel keeps failing.
+
+    Two channels are supported and may be combined: ntfy (``ntfy_topic``, with
+    an optional ``ntfy_token`` for protected topics) and a generic webhook that
+    receives the notification as JSON (``webhook_url``).
+
+    ``on_consecutive_failures`` counts *failed attempts in a row*, with a
+    session that stays up for ``[retry] stable_after`` seconds resetting the
+    counter — the same definition of "recovered" the reconnect budget uses.
+    ``cooldown`` is the minimum number of seconds between two alerts for the
+    same profile, so an overnight outage is one message per window rather than
+    one per attempt.
+    """
+
+    enabled: bool = False
+    on_consecutive_failures: int = 3
+    cooldown: int = 900
+    ntfy_topic: str = ""
+    ntfy_server: str = "https://ntfy.sh"
+    ntfy_token: str = ""
+    webhook_url: str = ""
+
+    @property
+    def channels(self) -> tuple[str, ...]:
+        """Names of the configured channels (empty when nothing is set)."""
+        found: list[str] = []
+        if self.ntfy_topic:
+            found.append("ntfy")
+        if self.webhook_url:
+            found.append("webhook")
+        return tuple(found)
+
+
+@dataclass(frozen=True)
 class WindowsConfig:
     """Platform specific knobs used only on Windows.
 
@@ -540,6 +576,7 @@ class TunnelConfig:
     daemon: DaemonConfig = field(default_factory=DaemonConfig)
     retry: RetryConfig = field(default_factory=RetryConfig)
     health: HealthConfig = field(default_factory=HealthConfig)
+    notify: NotifyConfig = field(default_factory=NotifyConfig)
     windows: WindowsConfig = field(default_factory=WindowsConfig)
     service: ServiceConfig = field(default_factory=ServiceConfig)
     source_path: str = ""
@@ -655,6 +692,7 @@ def _parse_config(data: Mapping[str, Any], config_path: str) -> TunnelConfig:
     daemon = _parse_daemon(data.get("daemon", {}), warnings)
     retry = _parse_retry(data.get("retry", {}), warnings)
     health = _parse_health(data.get("health", {}), warnings)
+    notify = _parse_notify(data.get("notify", {}), warnings)
     windows = _parse_windows(data.get("windows", {}), warnings)
     service = _parse_service(data.get("service", {}), warnings)
 
@@ -663,6 +701,7 @@ def _parse_config(data: Mapping[str, Any], config_path: str) -> TunnelConfig:
         daemon=daemon,
         retry=retry,
         health=health,
+        notify=notify,
         windows=windows,
         service=service,
         source_path=config_path,
@@ -677,7 +716,17 @@ def _parse_config(data: Mapping[str, Any], config_path: str) -> TunnelConfig:
 #: Recognised keys per section. Used to report typos instead of silently
 #: ignoring them; ``ssh.options`` is intentionally open-ended.
 _KNOWN_TOP_LEVEL = frozenset(
-    {"ssh", "tunnels", "profiles", "daemon", "retry", "health", "windows", "service"}
+    {
+        "ssh",
+        "tunnels",
+        "profiles",
+        "daemon",
+        "retry",
+        "health",
+        "notify",
+        "windows",
+        "service",
+    }
 )
 _KNOWN_PROFILE = frozenset({"name", "ssh", "tunnels"})
 _KNOWN_SSH = frozenset(
@@ -694,6 +743,17 @@ _KNOWN_RETRY = frozenset(
 )
 _KNOWN_HEALTH = frozenset(
     {"check_interval", "remote_check_enabled", "remote_check_timeout", "max_check_interval"}
+)
+_KNOWN_NOTIFY = frozenset(
+    {
+        "enabled",
+        "on_consecutive_failures",
+        "cooldown",
+        "ntfy_topic",
+        "ntfy_server",
+        "ntfy_token",
+        "webhook_url",
+    }
 )
 _KNOWN_WINDOWS = frozenset({"task_name", "ssh_exe", "pythonw_exe", "run_as"})
 _KNOWN_SERVICE = frozenset({"name", "autostart", "kill_timeout"})
@@ -948,6 +1008,47 @@ def _parse_health(section: Any, warnings: list[str] | None = None) -> HealthConf
             where="health",
         ),
     )
+
+
+def _parse_notify(section: Any, warnings: list[str] | None = None) -> NotifyConfig:
+    if not section:
+        return NotifyConfig()
+    _expect_table(section, "notify")
+    _warn_unknown_keys(section, _KNOWN_NOTIFY, "notify", warnings)
+    dft = NotifyConfig()
+    notify = NotifyConfig(
+        enabled=_optional_bool(
+            section, "enabled", default=dft.enabled, where="notify"
+        ),
+        on_consecutive_failures=_optional_int(
+            section,
+            "on_consecutive_failures",
+            default=dft.on_consecutive_failures,
+            minimum=1,
+            where="notify",
+        ),
+        cooldown=_optional_int(
+            section, "cooldown", default=dft.cooldown, minimum=0, where="notify"
+        ),
+        ntfy_topic=_optional_str(section, "ntfy_topic", default=""),
+        ntfy_server=_optional_str(section, "ntfy_server", default=dft.ntfy_server),
+        ntfy_token=_optional_str(section, "ntfy_token", default=""),
+        webhook_url=_optional_str(section, "webhook_url", default=""),
+    )
+    for key, value in (
+        ("ntfy_server", notify.ntfy_server),
+        ("webhook_url", notify.webhook_url),
+    ):
+        if value and not value.startswith(("http://", "https://")):
+            raise ConfigValidationError(
+                f"Field 'notify.{key}' must be an http(s) URL, got {value!r}"
+            )
+    if notify.enabled and not notify.channels and warnings is not None:
+        warnings.append(
+            "notify.enabled = true 但没有配置 ntfy_topic 或 webhook_url，"
+            "不会发出任何通知"
+        )
+    return notify
 
 
 def _parse_windows(section: Any, warnings: list[str] | None = None) -> WindowsConfig:
