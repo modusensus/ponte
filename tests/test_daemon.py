@@ -1091,7 +1091,8 @@ def test_status_names_the_target_of_each_profile(tmp_path) -> None:
     assert [profile.destination for profile in s.profiles] == [
         profile.destination for profile in cfg.profiles
     ]
-    assert "web.example.com" in (s.profiles[0].destination or "")
+    # 字面断言（而不是子串包含）：既钉死格式，也更严格。
+    assert s.profiles[0].destination == "testuser@web.example.com"
 
 
 def test_status_leaves_the_target_unknown_for_a_dropped_profile(tmp_path) -> None:
