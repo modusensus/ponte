@@ -140,6 +140,9 @@ class DaemonStatus:
     uptime_seconds: float = 0.0
     healthy: bool | None = None
     remote_ports: dict[int, bool] = dataclasses.field(default_factory=dict)
+    """``-R`` ports open on the server, ``{port: listening}``."""
+    local_ports: dict[int, bool] = dataclasses.field(default_factory=dict)
+    """``-L``/``-D`` ports this machine listens on, ``{port: listening}``."""
     health_error: str | None = None
     message: str = ""
 
@@ -334,6 +337,9 @@ class TunnelDaemon:
                     "healthy": status.all_healthy,
                     "remote_ports": {
                         str(p): ok for p, ok in status.remote_ports.items()
+                    },
+                    "local_ports": {
+                        str(p): ok for p, ok in status.local_ports.items()
                     },
                     "health_error": status.error,
                 }
@@ -737,6 +743,9 @@ class TunnelDaemon:
             remote_ports={
                 int(p): bool(ok) for p, ok in dict(info.get("remote_ports", {})).items()
             },
+            local_ports={
+                int(p): bool(ok) for p, ok in dict(info.get("local_ports", {})).items()
+            },
             health_error=info.get("health_error"),
             connect_attempts_total=int(attempts_raw) if attempts_raw is not None else None,
             sessions_total=int(sessions_raw) if sessions_raw is not None else None,
@@ -764,8 +773,12 @@ class TunnelDaemon:
         return TunnelManager(self.config).test_connection(timeout=timeout)
 
     def check_remote_ports(self, timeout: int = 10) -> dict[int, bool]:
-        """Probe which configured remote ports are currently listening."""
+        """Probe which configured remote (``-R``) ports are currently listening."""
         return TunnelManager(self.config).check_remote_ports(timeout=timeout)
+
+    def check_local_ports(self, timeout: float = 1.0) -> dict[int, bool]:
+        """Probe which configured local (``-L``/``-D``) ports are listening."""
+        return TunnelManager(self.config).check_local_ports(timeout=timeout)
 
     # -- Cross-platform service install ----------------------------------------
 

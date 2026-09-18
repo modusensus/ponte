@@ -21,6 +21,12 @@ __all__ = ["HealthChecker", "HealthStatus"]
 #: Type of a user-supplied run-loop callback: ``Callable[[HealthStatus], None]``.
 HealthCallback = Callable[["HealthStatus"], None]
 
+#: Timeout (seconds) for the in-process probe of a ``-L``/``-D`` local listener.
+#: A loopback connect either succeeds or is refused immediately, so this is
+#: deliberately much shorter than ``remote_check_timeout`` (which has to pay
+#: for an SSH round trip).
+_LOCAL_PROBE_TIMEOUT = 1.0
+
 
 @dataclasses.dataclass(frozen=True)
 class HealthStatus:
@@ -28,9 +34,12 @@ class HealthStatus:
 
     Attributes:
         process_alive: True if the SSH process is still running.
-        remote_ports: Mapping of remote port -> listening (True/False).
+        remote_ports: Mapping of remote port -> listening (True/False), for the
+            ``-R`` tunnels probed on the server.
+        local_ports: Mapping of local port -> listening (True/False), for the
+            ``-L``/``-D`` listeners probed on this machine.
         all_healthy: Overall health — the process is alive, every checked
-            remote port is listening, and the check did not error.
+            remote *and* local port is listening, and the check did not error.
         timestamp: Unix time (``time.time()``) when the check was performed.
         error: Human-readable error message if the check partially failed,
             else ``None``.
@@ -41,15 +50,20 @@ class HealthStatus:
     all_healthy: bool
     timestamp: float
     error: str | None = None
+    local_ports: dict[int, bool] = dataclasses.field(default_factory=dict)
 
     def __str__(self) -> str:  # human-friendly one-liner for logs
         ports = {
             port: ("ok" if ok else "down") for port, ok in self.remote_ports.items()
         }
+        local = {
+            port: ("ok" if ok else "down") for port, ok in self.local_ports.items()
+        }
         return (
             f"process={'alive' if self.process_alive else 'dead'}, "
             f"remote_ports={ports}, "
-            f"healthy={self.all_healthy}"
+            f"local_ports={local},"
+            f" healthy={self.all_healthy}"
             + (f", error={self.error!r}" if self.error else "")
         )
 
@@ -62,7 +76,9 @@ class HealthChecker:
 
     * ``check_interval``       — default seconds between checks (``run_loop``
       accepts its own ``interval`` override).
-    * ``remote_check_enabled`` — whether remote ports are probed at all.
+    * ``remote_check_enabled`` — whether the *server-side* probe (which costs
+      an SSH connection) runs at all. The local-listener probe of ``-L``/``-D``
+      tunnels is an in-process loopback connect, so it always runs.
     * ``remote_check_timeout`` — per-port probe timeout, seconds.
     * ``max_check_interval``   — ceiling (seconds) on the check interval under
       exponential backoff (see :meth:`run_loop`).
@@ -110,7 +126,17 @@ class HealthChecker:
         # ``all(remote_ports.values())`` is vacuously True and process_alive
         # alone determines health.
 
-        # 3. Aggregate. An error on any sub-check makes the result unhealthy —
+        # 3. Are the local listeners of -L/-D tunnels up? Cheap enough
+        # (loopback connect, no SSH) to run on every tick.
+        local_ports: dict[int, bool] = {}
+        try:
+            local_ports = self.check_local_ports()
+        except Exception as exc:  # noqa: BLE001
+            error_messages.append(
+                f"local port check failed: {type(exc).__name__}: {exc}"
+            )
+
+        # 4. Aggregate. An error on any sub-check makes the result unhealthy —
         # a failed probe is indistinguishable from a down tunnel, so be
         # conservative.
         error = "; ".join(error_messages) if error_messages else None
@@ -118,6 +144,7 @@ class HealthChecker:
             error is None
             and process_alive
             and all(remote_ports.values())
+            and all(local_ports.values())
         )
         return HealthStatus(
             process_alive=process_alive,
@@ -125,6 +152,7 @@ class HealthChecker:
             all_healthy=all_healthy,
             timestamp=snapshot_time,
             error=error,
+            local_ports=local_ports,
         )
 
     def check_remote_ports(self) -> dict[int, bool]:
@@ -153,6 +181,31 @@ class HealthChecker:
         # Unknown shape: fail loudly rather than silently report health.
         raise TypeError(
             f"check_remote_ports() returned unsupported type {type(result).__name__}"
+        )
+
+    def check_local_ports(self) -> dict[int, bool]:
+        """Probe the local listeners of ``-L``/``-D`` tunnels.
+
+        Returns ``{}`` — with no error — when the manager has no local probe
+        (a test stand-in, or a config whose tunnels are all ``-R``), so health
+        quietly degrades to the process + remote-port checks.
+        """
+        method = getattr(self.manager, "check_local_ports", None)
+        if not callable(method):
+            return {}
+        try:
+            result = method(timeout=_LOCAL_PROBE_TIMEOUT)
+        except TypeError:
+            # The tunnel manager may not accept a timeout argument.
+            result = method()
+
+        if isinstance(result, dict):
+            return {int(port): bool(ok) for port, ok in result.items()}
+        if isinstance(result, (list, tuple, set, frozenset)):
+            # An iterable of ports that are open — treat each as healthy.
+            return {int(port): True for port in result}
+        raise TypeError(
+            f"check_local_ports() returned unsupported type {type(result).__name__}"
         )
 
     # -- Background loop ------------------------------------------------------

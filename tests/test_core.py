@@ -21,7 +21,8 @@ _CREATE_NO_WINDOW_VALUE = 0x08000000
 
 
 def _cfg(*, host: str = "example.com", user: str = "testuser", port: int = 22,
-         ssh_exe: str = "/usr/bin/ssh") -> TunnelConfig:
+         ssh_exe: str = "/usr/bin/ssh",
+         tunnels: list[Tunnel] | None = None) -> TunnelConfig:
     return TunnelConfig(
         ssh=SSHConfig(
             host=host,
@@ -31,12 +32,19 @@ def _cfg(*, host: str = "example.com", user: str = "testuser", port: int = 22,
             known_hosts_file="/keys/known_hosts",
             options=SSHOptions(),
         ),
-        tunnels=[
+        tunnels=tunnels if tunnels is not None else [
             Tunnel(remote_port=23334, local_host="localhost", local_port=2222),
             Tunnel(remote_port=17897, local_host="localhost", local_port=7897),
         ],
         windows=WindowsConfig(ssh_exe=ssh_exe),
     )
+
+
+def _flag_pairs(args: list[str], flag: str) -> list[tuple[str, str]]:
+    """Return every ``(flag, spec)`` pair for *flag* in an ssh command line."""
+    return [
+        (args[i], args[i + 1]) for i in range(len(args) - 1) if args[i] == flag
+    ]
 
 
 def test_build_args_full(monkeypatch) -> None:
@@ -126,6 +134,114 @@ def test_check_remote_ports_error(monkeypatch) -> None:
     )
     tm = TunnelManager(_cfg())
     assert tm.check_remote_ports(timeout=5) == {23334: False, 17897: False}
+
+
+# ---------------------------------------------------------------------------
+# 隧道类型：-R / -L / -D
+# ---------------------------------------------------------------------------
+
+
+def test_build_args_mixed_tunnel_kinds(monkeypatch) -> None:
+    """-R / -L / -D 混用时各自生成独立的转发参数，共用一条连接。"""
+    monkeypatch.setattr("ponte.core._find_ssh", lambda _cfg: "/usr/bin/ssh")
+    tm = TunnelManager(
+        _cfg(
+            tunnels=[
+                Tunnel(remote_port=23334, local_host="localhost", local_port=2222),
+                Tunnel(
+                    remote_port=5432,
+                    local_host="127.0.0.1",
+                    local_port=8080,
+                    kind="local",
+                    remote_host="db.internal",
+                ),
+                Tunnel(
+                    remote_port=None,
+                    local_host="127.0.0.1",
+                    local_port=1080,
+                    kind="dynamic",
+                ),
+            ]
+        )
+    )
+    args = tm.build_args()
+    assert ("-R", "23334:localhost:2222") in _flag_pairs(args, "-R")
+    assert ("-L", "127.0.0.1:8080:db.internal:5432") in _flag_pairs(args, "-L")
+    assert ("-D", "127.0.0.1:1080") in _flag_pairs(args, "-D")
+    assert args[-1] == "testuser@example.com"
+
+
+def test_build_args_remote_bind_address_opt_in(monkeypatch) -> None:
+    """-R 只有显式配置 remote_host 时才带服务器侧绑定地址（默认行为不变）。"""
+    monkeypatch.setattr("ponte.core._find_ssh", lambda _cfg: "/usr/bin/ssh")
+    plain = TunnelManager(_cfg(tunnels=[Tunnel(23334, "localhost", 2222)]))
+    assert _flag_pairs(plain.build_args(), "-R") == [("-R", "23334:localhost:2222")]
+
+    bound = TunnelManager(
+        _cfg(
+            tunnels=[
+                Tunnel(23334, "localhost", 2222, remote_host="0.0.0.0"),
+            ]
+        )
+    )
+    assert _flag_pairs(bound.build_args(), "-R") == [
+        ("-R", "0.0.0.0:23334:localhost:2222")
+    ]
+
+
+def test_check_remote_ports_skips_non_remote_kinds(monkeypatch) -> None:
+    """只有 -R 才有服务器侧端口；没有 -R 时不得多开一条 SSH 连接。"""
+    monkeypatch.setattr("ponte.core._find_ssh", lambda _cfg: "/usr/bin/ssh")
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        "ponte.core.subprocess.run", lambda *a, **k: calls.append(a)
+    )
+    tm = TunnelManager(
+        _cfg(
+            tunnels=[
+                Tunnel(None, "127.0.0.1", 1080, kind="dynamic"),
+                Tunnel(
+                    5432, "127.0.0.1", 8080, kind="local", remote_host="db.internal"
+                ),
+            ]
+        )
+    )
+    assert tm.check_remote_ports(timeout=1) == {}
+    assert calls == []
+
+
+def test_check_local_ports_probes_local_listeners(monkeypatch) -> None:
+    """本地探测是 loopback connect：覆盖 -L/-D，跳过 -R，通配绑定按 127.0.0.1 探。"""
+    monkeypatch.setattr("ponte.core._find_ssh", lambda _cfg: "/usr/bin/ssh")
+    seen: list[tuple[str, int]] = []
+
+    class _Conn:
+        def __enter__(self) -> _Conn:
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+    def fake_connect(address: tuple[str, int], timeout: float | None = None) -> _Conn:
+        seen.append(address)
+        if address == ("127.0.0.1", 1080):
+            raise OSError("connection refused")
+        return _Conn()
+
+    monkeypatch.setattr("ponte.core.socket.create_connection", fake_connect)
+    tm = TunnelManager(
+        _cfg(
+            tunnels=[
+                Tunnel(23334, "localhost", 2222),
+                Tunnel(
+                    5432, "0.0.0.0", 8080, kind="local", remote_host="db.internal"
+                ),
+                Tunnel(None, "127.0.0.1", 1080, kind="dynamic"),
+            ]
+        )
+    )
+    assert tm.check_local_ports() == {8080: True, 1080: False}
+    assert seen == [("127.0.0.1", 8080), ("127.0.0.1", 1080)]
 
 
 def test_stop_no_process() -> None:

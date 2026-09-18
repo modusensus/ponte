@@ -148,6 +148,61 @@ def test_check_remote_ports_type_error() -> None:
     assert "TypeError" in (s.error or "")
 
 
+# ---------------------------------------------------------------------------
+# 本地监听端口（-L / -D）
+# ---------------------------------------------------------------------------
+
+
+class _LocalTM(_TM):
+    """``_TM`` 加上本地监听探测（-L / -D 的健康检查面）。"""
+
+    def __init__(self, local: object = None, alive: bool = True) -> None:
+        super().__init__(alive=alive, ports="list")
+        self._local = {} if local is None else local
+        self.local_timeout: object = "__unset__"
+
+    def check_local_ports(self, **kw) -> object:
+        self.local_timeout = kw.get("timeout")
+        if isinstance(self._local, Exception):
+            raise self._local
+        return self._local
+
+
+def test_local_ports_are_reported_and_affect_health() -> None:
+    """-L/-D 的本地监听端口参与健康判定，且用短超时探测。"""
+    from ponte.health import _LOCAL_PROBE_TIMEOUT
+
+    tm = _LocalTM(local={1080: True, 9090: False})
+    s = HealthChecker(tm, _hc()).check()
+    assert s.local_ports == {1080: True, 9090: False}
+    assert s.all_healthy is False  # 本地 SOCKS 端口没在监听
+    assert "local_ports" in str(s)
+    assert tm.local_timeout == _LOCAL_PROBE_TIMEOUT
+
+
+def test_local_port_check_failure_is_reported() -> None:
+    hc = HealthChecker(_LocalTM(local=ConnectionError("nope")), _hc())
+    s = hc.check()
+    assert s.all_healthy is False
+    assert "local port check failed" in (s.error or "")
+
+
+def test_manager_without_local_probe_is_tolerated() -> None:
+    """没有本地探测能力的 manager 不应报错，也不应被当成不健康。"""
+    hc = HealthChecker(_TM(alive=True, ports="list"), _hc())
+    s = hc.check()
+    assert s.local_ports == {}
+    assert s.all_healthy is True
+
+
+def test_check_local_ports_accepts_iterable_and_rejects_junk() -> None:
+    assert HealthChecker(_LocalTM(local=[1080]), _hc()).check_local_ports() == {
+        1080: True
+    }
+    with pytest.raises(TypeError):
+        HealthChecker(_LocalTM(local="nope"), _hc()).check_local_ports()
+
+
 def test_backoff_interval_formula() -> None:
     """Pure exponential backoff grows by 2**failures and caps at the max."""
     assert HealthChecker._backoff_interval(60.0, 0, 300.0) == 60.0

@@ -32,12 +32,41 @@ TCPKeepAlive = "yes"
 # 其它未列出的键会被原样透传为 `-o key=value`，例如：
 # Compression = "yes"
 
-# 反向隧道：在服务器上打开 remote_port，转发回本地 local_host:local_port
+# 转发规则。每条规则的 local_host:local_port 都是「本机这一端」，
+# remote_host:remote_port 都是「服务器那一端」；kind 决定用哪个 ssh 转发开关。
+#
+#   kind = "remote"  （默认，-R）服务器监听 remote_port，转发回本机 local_host:local_port
+#   kind = "local"     （-L）本机监听 local_host:local_port，经服务器转发到 remote_host:remote_port
+#   kind = "dynamic"   （-D）本机在 local_host:local_port 上跑一个 SOCKS5 代理
+#
+# 同一配置文件里可以混用，三种规则共用一条 SSH 连接。
+# kind = "local"/"dynamic" 省略 local_host 时默认绑定 127.0.0.1（只本机可达）。
+
+# 反向隧道：在服务器上打开 23334，转发回本机 2222
 [[tunnels]]
+kind = "remote"
 remote_port = 23334
 local_host = "localhost"
 local_port = 2222
 description = "示例：把远端 23334 转发到本地 2222"
+# 仅在服务器 GatewayPorts=yes 时才需要指定服务器侧的绑定地址
+# remote_host = "127.0.0.1"
+
+# 本地转发：本机 8080 → 经服务器访问内网 db.internal:5432
+# [[tunnels]]
+# kind = "local"
+# local_host = "127.0.0.1"   # 本机监听地址，可省略
+# local_port = 8080          # 本机监听端口
+# remote_host = "db.internal"
+# remote_port = 5432
+# description = "示例：本机 8080 转发到内网数据库"
+
+# 动态转发：本机 1080 上开一个 SOCKS5 代理，目标由客户端每次连接自行选择
+# [[tunnels]]
+# kind = "dynamic"
+# local_host = "127.0.0.1"   # 可省略
+# local_port = 1080
+# description = "示例：本机 SOCKS5 代理"
 
 [daemon]
 # pid_file / log_file 缺省时按平台自动选择：

@@ -235,6 +235,9 @@ def status(
                         "remote_ports": {
                             str(p): ok for p, ok in s.remote_ports.items()
                         },
+                        "local_ports": {
+                            str(p): ok for p, ok in s.local_ports.items()
+                        },
                         "connect_attempts_total": s.connect_attempts_total,
                         "sessions_total": s.sessions_total,
                         "reconnects_total": s.reconnects_total,
@@ -274,10 +277,12 @@ def status(
             health_markup = "[red]异常[/red]" + (f"（{detail}）" if detail else "")
         table.add_row("健康状态", health_markup)
 
-        if s.remote_ports:
-            for port in sorted(s.remote_ports):
-                mark = "[green]监听中[/green]" if s.remote_ports[port] else "[red]未监听[/red]"
-                table.add_row(f"远程端口 {port}", mark)
+        for port, ok in sorted(s.remote_ports.items()):
+            mark = "[green]监听中[/green]" if ok else "[red]未监听[/red]"
+            table.add_row(f"远程端口 {port}", mark)
+        for port, ok in sorted(s.local_ports.items()):
+            mark = "[green]监听中[/green]" if ok else "[red]未监听[/red]"
+            table.add_row(f"本地端口 {port}", mark)
 
         # 隧道统计：区分“守护进程活了多久”和“隧道活了多久”，暴露反复断线。
         if s.current_session_at is not None:
@@ -397,11 +402,12 @@ def _render_watch(s) -> RenderableType:  # noqa: ANN001 - DaemonStatus cycle gua
             f"会话 {s.sessions_total} · 重连 {s.reconnects_total} · 在线率 {avail}",
         )
 
-    for port in sorted(s.remote_ports):
-        mark = (
-            "[green]监听中[/green]" if s.remote_ports[port] else "[red]未监听[/red]"
-        )
+    for port, ok in sorted(s.remote_ports.items()):
+        mark = "[green]监听中[/green]" if ok else "[red]未监听[/red]"
         table.add_row(f"远程端口 {port}", mark)
+    for port, ok in sorted(s.local_ports.items()):
+        mark = "[green]监听中[/green]" if ok else "[red]未监听[/red]"
+        table.add_row(f"本地端口 {port}", mark)
 
     if s.last_disconnect_reason:
         since = ""
@@ -496,15 +502,20 @@ def test(
 def check(
     timeout: int = typer.Option(10, "--timeout", help="端口检查超时（秒）"),
 ) -> None:
-    """检查各反向隧道的远程端口是否在监听。"""
+    """检查隧道端口：``-R`` 在服务器上、``-L``/``-D`` 在本机。"""
     try:
-        ports = _daemon().check_remote_ports(timeout=timeout)
-        if not ports:
+        daemon = _daemon()
+        remote = daemon.check_remote_ports(timeout=timeout)
+        local = daemon.check_local_ports()
+        if not remote and not local:
             console.print("[yellow]没有任何配置的隧道端口[/yellow]")
             raise typer.Exit(code=0)
-        for port in sorted(ports):
-            mark = "[green]监听中[/green]" if ports[port] else "[red]未监听[/red]"
-            console.print(f"端口 {port}: {mark}")
+        for port, ok in sorted(remote.items()):
+            mark = "[green]监听中[/green]" if ok else "[red]未监听[/red]"
+            console.print(f"远程端口 {port}: {mark}")
+        for port, ok in sorted(local.items()):
+            mark = "[green]监听中[/green]" if ok else "[red]未监听[/red]"
+            console.print(f"本地端口 {port}: {mark}")
     except typer.Exit:
         raise
     except Exception as exc:
@@ -561,11 +572,10 @@ def config() -> None:
         table.add_row("服务器", f"{cfg.ssh.user}@{cfg.ssh.host}")
         table.add_row("SSH 端口", str(cfg.ssh.port))
         tunnel_lines = [
-            f"- 远程 {t.remote_port} → {t.local_host}:{t.local_port}"
-            + (f"  ({escape(t.description)})" if t.description else "")
+            t.summary + (f"  ({escape(t.description)})" if t.description else "")
             for t in cfg.tunnels
         ]
-        table.add_row("反向隧道", "\n".join(tunnel_lines) or "（无）")
+        table.add_row("隧道", "\n".join(tunnel_lines) or "（无）")
         table.add_row(
             "retry",
             f"max_retries={retry.max_retries}, base_delay={retry.base_delay}s, "
