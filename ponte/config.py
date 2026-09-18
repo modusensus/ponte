@@ -41,6 +41,8 @@ __all__ = [
     "SSHConfig",
     "SSHOptions",
     "Tunnel",
+    "TUNNEL_FLAGS",
+    "DEFAULT_BIND_HOST",
     "DaemonConfig",
     "RetryConfig",
     "HealthConfig",
@@ -66,6 +68,22 @@ CONFIG_FILENAME = "config.toml"
 
 #: Name of the shipped template used by ``ponte init``.
 EXAMPLE_FILENAME = "config.example.toml"
+
+#: Tunnel kinds mapped to the OpenSSH forwarding flag each one expands to.
+#:
+#: ``remote`` (``-R``)  — the *server* listens and forwards into the tunnel.
+#: ``local``  (``-L``)  — *this* machine listens and forwards out through it.
+#: ``dynamic``(``-D``)  — *this* machine serves a SOCKS5 proxy on that port.
+TUNNEL_FLAGS: dict[str, str] = {"remote": "-R", "local": "-L", "dynamic": "-D"}
+
+#: Bind address assumed for a ``-L``/``-D`` rule that does not name ``local_host``.
+#: Loopback on purpose: a forwarding rule or SOCKS proxy reachable from the
+#: whole LAN because a field was omitted is exactly the kind of accident a
+#: tunnel manager should not enable.
+DEFAULT_BIND_HOST = "127.0.0.1"
+
+#: ``local_host`` values that mean "every interface" and cannot be connected to.
+WILDCARD_HOSTS = frozenset({"0.0.0.0", "::", "*"})
 
 # Pathlike inputs accepted by get_config/load_config.
 _Path = str | os.PathLike[str]
@@ -130,16 +148,78 @@ class SSHOptions:
 
 @dataclass(frozen=True)
 class Tunnel:
-    """A single reverse-forward rule: remote_port -> local_host:local_port."""
+    """A single SSH forwarding rule.
 
-    remote_port: int
-    """Port opened on the SSH server, forwarding into the tunnel."""
+    ``kind`` selects the OpenSSH flag and therefore which fields are
+    meaningful. ``local_host:local_port`` is always the *client-side* end of the
+    rule; ``remote_host:remote_port`` is always the *server-side* end:
+
+    ``"remote"`` (``-R``, the default)
+        The server listens on ``remote_port`` and forwards into the tunnel to
+        ``local_host:local_port``. Setting ``remote_host`` turns it into the
+        server-side bind address, which only matters with ``GatewayPorts=yes``;
+        it is left unset by default so the emitted command line stays identical
+        to what pre-``kind`` ponte versions produced.
+    ``"local"`` (``-L``)
+        *This* machine listens on ``local_host:local_port`` and forwards over
+        the tunnel to ``remote_host:remote_port`` as reached from the server.
+    ``"dynamic"`` (``-D``)
+        *This* machine runs a SOCKS5 proxy on ``local_host:local_port``; the
+        destination is chosen per connection, so both ``remote_*`` are unused.
+    """
+
+    remote_port: int | None
+    """Server-side port: the port ``-R`` opens, or the ``-L`` destination port."""
     local_host: str
-    """Destination host on the client side that receives forwarded traffic."""
+    """Client-side host: the ``-R`` destination, or the ``-L``/``-D`` bind address."""
     local_port: int
-    """Destination port on the client side that receives forwarded traffic."""
+    """Client-side port: the ``-R`` destination, or the ``-L``/``-D`` listen port."""
     description: str = ""
     """Human readable description of what this tunnel is for."""
+    kind: str = "remote"
+    """One of ``remote`` (``-R``), ``local`` (``-L``) or ``dynamic`` (``-D``)."""
+    remote_host: str | None = None
+    """Server-side host: the ``-L`` destination host, or the ``-R`` bind address."""
+
+    @property
+    def flag(self) -> str:
+        """The OpenSSH forwarding flag this tunnel expands to (``-R``/``-L``/``-D``)."""
+        return TUNNEL_FLAGS.get(self.kind, "-R")
+
+    @property
+    def is_remote(self) -> bool:
+        """``True`` for ``-R``: the *server* side owns the listening port."""
+        return self.kind == "remote"
+
+    @property
+    def spec(self) -> str:
+        """The argument OpenSSH expects immediately after :attr:`flag`."""
+        if self.kind == "dynamic":
+            return f"{self.local_host}:{self.local_port}"
+        if self.kind == "local":
+            return (
+                f"{self.local_host}:{self.local_port}:"
+                f"{self.remote_host or 'localhost'}:{self.remote_port}"
+            )
+        forward = f"{self.remote_port}:{self.local_host}:{self.local_port}"
+        if self.remote_host:
+            forward = f"{self.remote_host}:{forward}"
+        return forward
+
+    @property
+    def summary(self) -> str:
+        """One-line human readable rendering, used by ``ponte config``."""
+        if self.kind == "dynamic":
+            return f"-D {self.local_host}:{self.local_port}（SOCKS5 代理）"
+        if self.kind == "local":
+            return (
+                f"-L {self.local_host}:{self.local_port} → "
+                f"{self.remote_host or 'localhost'}:{self.remote_port}"
+            )
+        line = f"-R {self.remote_port} → {self.local_host}:{self.local_port}"
+        if self.remote_host:
+            line += f"（服务器绑定 {self.remote_host}）"
+        return line
 
 
 @dataclass(frozen=True)
@@ -528,7 +608,9 @@ _KNOWN_TOP_LEVEL = frozenset(
 _KNOWN_SSH = frozenset(
     {"host", "port", "user", "identity_file", "known_hosts_file", "options"}
 )
-_KNOWN_TUNNEL = frozenset({"remote_port", "local_host", "local_port", "description"})
+_KNOWN_TUNNEL = frozenset(
+    {"kind", "remote_port", "remote_host", "local_host", "local_port", "description"}
+)
 _KNOWN_DAEMON = frozenset(
     {"pid_file", "log_file", "log_max_bytes", "log_backup_count"}
 )
@@ -607,16 +689,57 @@ def _parse_tunnels(section: Any, warnings: list[str] | None = None) -> list[Tunn
         where = f"tunnels[{index}]"
         _expect_table(item, where)
         _warn_unknown_keys(item, _KNOWN_TUNNEL, where, warnings)
-        remote_port = _required_int(item, "remote_port", minimum=1, maximum=65535, where=where)
-        local_port = _required_int(item, "local_port", minimum=1, maximum=65535, where=where)
-        local_host = _require_str(item, "local_host", where)
+        kind = _optional_str(item, "kind", default="remote")
+        if kind not in TUNNEL_FLAGS:
+            raise ConfigValidationError(
+                f"Field '{where}.kind' must be one of "
+                f"{', '.join(sorted(TUNNEL_FLAGS))}, got {kind!r}"
+            )
+        local_port = _required_int(
+            item, "local_port", minimum=1, maximum=65535, where=where
+        )
         description = _optional_str(item, "description", default="")
+
+        if kind == "dynamic":
+            # A SOCKS proxy picks its destination per connection: anything
+            # remote-shaped here is either a misunderstanding or a copy-paste
+            # leftover, so say so instead of silently dropping it.
+            ignored = [key for key in ("remote_host", "remote_port") if key in item]
+            if ignored and warnings is not None:
+                warnings.append(
+                    f"{where}.kind = 'dynamic' 不使用 "
+                    + " / ".join(ignored)
+                    + "，已忽略"
+                )
+            remote_port: int | None = None
+            remote_host: str | None = None
+            local_host = _optional_str(item, "local_host", default=None) or DEFAULT_BIND_HOST
+        else:
+            remote_port = _required_int(
+                item, "remote_port", minimum=1, maximum=65535, where=where
+            )
+            remote_host = _optional_str(item, "remote_host", default=None)
+            if kind == "local":
+                local_host = (
+                    _optional_str(item, "local_host", default=None) or DEFAULT_BIND_HOST
+                )
+                if remote_host is None:
+                    raise ConfigValidationError(
+                        f"Missing required field '{where}.remote_host'"
+                        " (a 'local' tunnel needs the host the server forwards to)"
+                    )
+            else:
+                # -R destination: required, and has no sane default.
+                local_host = _require_str(item, "local_host", where)
+
         tunnels.append(
             Tunnel(
                 remote_port=remote_port,
                 local_host=local_host,
                 local_port=local_port,
                 description=description,
+                kind=kind,
+                remote_host=remote_host,
             )
         )
     return tunnels
@@ -732,6 +855,8 @@ def _validate(cfg: TunnelConfig) -> None:
     if not cfg.tunnels:
         raise ConfigValidationError("At least one tunnel must be configured under 'tunnels'")
 
+    _reject_duplicate_listeners(cfg.tunnels)
+
     # The identity file is essential for non-interactive operation; fail fast
     # with a clear message rather than letting SSH fail later.
     if cfg.ssh.identity_file and not os.path.isfile(cfg.ssh.identity_file):
@@ -742,6 +867,42 @@ def _validate(cfg: TunnelConfig) -> None:
         raise ConfigValidationError(
             f"Known-hosts file does not exist: {cfg.ssh.known_hosts_file}"
         )
+
+
+def _reject_duplicate_listeners(tunnels: list[Tunnel]) -> None:
+    """Reject two rules that would try to listen on the same port.
+
+    Every forward is established with ``ExitOnForwardFailure=yes``, so a
+    duplicate listen request makes OpenSSH drop the *whole* connection — the
+    tunnel then reconnects forever with a cryptic ``remote port forwarding
+    failed`` in the log. Catching it at config-load time turns that loop into
+    one clear message.
+
+    ``-R`` ports live on the server, ``-L``/``-D`` ports live on this machine,
+    so the two namespaces are checked separately; ``-L`` and ``-D`` do compete
+    with each other because both bind locally.
+    """
+    remote_seen: dict[int, int] = {}
+    local_seen: dict[tuple[str, int], int] = {}
+    for index, tunnel in enumerate(tunnels):
+        if tunnel.is_remote:
+            port = int(tunnel.remote_port or 0)
+            previous = remote_seen.get(port)
+            if previous is not None:
+                raise ConfigValidationError(
+                    f"tunnels[{index}] and tunnels[{previous}] both request remote "
+                    f"port {port} on the server"
+                )
+            remote_seen[port] = index
+            continue
+        key = (tunnel.local_host, tunnel.local_port)
+        previous_index = local_seen.get(key)
+        if previous_index is not None:
+            raise ConfigValidationError(
+                f"tunnels[{index}] and tunnels[{previous_index}] both listen on "
+                f"{tunnel.local_host}:{tunnel.local_port} locally"
+            )
+        local_seen[key] = index
 
 
 # ---------------------------------------------------------------------------

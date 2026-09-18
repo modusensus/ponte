@@ -187,6 +187,29 @@ s5 = hc5.check()
 assert s5.remote_ports == {} and s5.all_healthy is True, s5
 print("health: remote check disabled OK ->", s5.all_healthy)
 
+# ---- local listeners of -L / -D ----
+# 没有本地探测能力的 manager 自动跳过（不报错、不影响健康）。
+assert s5.local_ports == {}, s5.local_ports
+
+class TM3(TM2):
+    def __init__(self, local):
+        super().__init__(alive=True, ports="list")
+        self._local = local
+    def check_local_ports(self, **kw): return self._local
+
+hc8 = health.HealthChecker(TM3({1080: False}), _HC(60, True, 10))
+s8 = hc8.check()
+assert s8.local_ports == {1080: False} and s8.all_healthy is False, s8
+assert "local_ports" in str(s8)
+print("health: local -L/-D listener check OK ->", s8.local_ports)
+
+class TM4(TM2):
+    def check_local_ports(self, **kw): raise ConnectionError("local probe boom")
+
+s9 = health.HealthChecker(TM4(alive=True, ports="list"), _HC(60, True, 10)).check()
+assert s9.all_healthy is False and "local port check failed" in (s9.error or ""), s9.error
+print("health: local probe failure surfaced OK ->", s9.error)
+
 # ---- check-interval backoff (pure function, deterministic) ----
 # 健康检查失败会指数退避（上限 max_check_interval），正常时保持基础间隔。
 assert health.HealthChecker._backoff_interval(60, 0, 300) == 60

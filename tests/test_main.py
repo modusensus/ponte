@@ -231,10 +231,12 @@ def test_logs_no_file(monkeypatch) -> None:
 class _FakeDaemonWithActions:
     def __init__(self, *, running: bool = False, test_ok: bool = True,
                  ports: dict[int, bool] | None = None,
+                 local_ports: dict[int, bool] | None = None,
                  install_result: str = "installed") -> None:
         self._running = running
         self._test_ok = test_ok
         self._ports = ports or {}
+        self._local_ports = local_ports or {}
         self._install_result = install_result
         self.log_file = ""
         self.stopped = False
@@ -247,6 +249,7 @@ class _FakeDaemonWithActions:
             uptime_seconds=10,
             healthy=True,
             remote_ports=self._ports,
+            local_ports=self._local_ports,
         )
 
     def start(self, foreground: bool = False) -> int:
@@ -266,6 +269,9 @@ class _FakeDaemonWithActions:
 
     def check_remote_ports(self, timeout: int = 10) -> dict[int, bool]:
         return self._ports
+
+    def check_local_ports(self, timeout: float = 1.0) -> dict[int, bool]:
+        return self._local_ports
 
     def install_service(self) -> str:
         return self._install_result
@@ -336,6 +342,59 @@ def test_check_command_no_ports(monkeypatch) -> None:
     monkeypatch.setattr("ponte.main._daemon", lambda: fake)
     result = CliRunner().invoke(app, ["check"])
     assert result.exit_code == 0
+
+
+def test_check_command_reports_local_ports(monkeypatch) -> None:
+    """-L/-D 的本地监听端口也要出现在 check 结果里。"""
+    fake = _FakeDaemonWithActions(ports={23334: True}, local_ports={1080: False})
+    monkeypatch.setattr("ponte.main._daemon", lambda: fake)
+    result = CliRunner().invoke(app, ["check"])
+    assert result.exit_code == 0
+    assert "远程端口 23334" in result.output
+    assert "本地端口 1080" in result.output
+
+
+def test_status_and_watch_render_local_ports(monkeypatch) -> None:
+    """本地端口在 status 表格与 watch 看板里各有独立一行。"""
+    from ponte.main import _render_watch, console
+
+    s = DaemonStatus(
+        running=True,
+        pid=1,
+        uptime_seconds=10.0,
+        healthy=False,
+        remote_ports={23334: True},
+        local_ports={1080: False},
+    )
+
+    class _Daemon:
+        def status(self) -> DaemonStatus:
+            return s
+
+    monkeypatch.setattr("ponte.main._daemon", lambda: _Daemon())
+    result = CliRunner().invoke(app, ["status"])
+    assert "远程端口 23334" in result.output
+    assert "本地端口 1080" in result.output
+
+    with console.capture() as capture:
+        console.print(_render_watch(s))
+    assert "本地端口 1080" in capture.get()
+
+
+def test_status_json_includes_local_ports(monkeypatch) -> None:
+    """--json 契约里也带上本地端口（监控系统消费）。"""
+    import json as _json
+
+    s = DaemonStatus(running=True, pid=7, local_ports={1080: True})
+
+    class _Daemon:
+        def status(self) -> DaemonStatus:
+            return s
+
+    monkeypatch.setattr("ponte.main._daemon", lambda: _Daemon())
+    result = CliRunner().invoke(app, ["status", "--json"])
+    assert result.exit_code == 0
+    assert _json.loads(result.output)["local_ports"] == {"1080": True}
 
 
 def test_install_command(monkeypatch) -> None:

@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Duplicate listen ports are now a configuration error.** Every forward is
+  established with `ExitOnForwardFailure=yes`, so a repeated `remote_port`, or
+  an `-L`/`-D` pair sharing a local port, made OpenSSH drop the *whole*
+  connection and put the tunnel into an endless reconnect loop. The config is
+  now rejected up front, by a message that names both offending rules.
 - **The PyPI distribution is `ponte-cli`.** The bare name `ponte` is already
   taken on PyPI by an unrelated project, so `pyproject.toml` declares
   `name = "ponte-cli"`. The import package (`ponte`), the console command
@@ -28,6 +33,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`-L` (local) and `-D` (SOCKS5) forwarding, not just `-R`.** A `[[tunnels]]`
+  rule now takes `kind = "remote" | "local" | "dynamic"` — `remote` is the
+  default, so existing configs parse and behave exactly as before — and ponte
+  emits the matching OpenSSH flag. The kinds can be mixed in one config and
+  share a single SSH connection, which turns ponte from a reverse-tunnel
+  script into a general forwarding tool. For `-L`/`-D` the bind address
+  defaults to `127.0.0.1`, so an omitted field is never a LAN exposure; `-R`
+  keeps omitting the server-side bind address unless `remote_host` is set
+  explicitly (only meaningful with `GatewayPorts=yes`).
+- **Health checks cover the local end too.** The listeners of `-L`/`-D`
+  tunnels are probed with an in-process loopback connect on every health tick
+  (no SSH connection, so it is free), and their state is persisted, rendered by
+  `ponte status` / `ponte watch` and reported by `ponte check` next to the
+  remote ports.
 - **Tunnel statistics that separate "daemon alive" from "tunnel up".** The
   status file now carries cumulative counters — connection attempts,
   established sessions, scheduled reconnects, accumulated tunnel uptime and

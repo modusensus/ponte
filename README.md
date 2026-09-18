@@ -2,7 +2,7 @@
 
 # ponte
 
-**A persistent SSH reverse-tunnel daemon** · 持久 SSH 反向隧道守护工具
+**A persistent SSH tunnel daemon — reverse, local & SOCKS** · 持久 SSH 隧道守护工具（反向 / 本地 / SOCKS）
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
@@ -19,12 +19,17 @@
 
 # English
 
-> Keep `ssh -N -R` alive across network drops and reboots — reconnect with
-> exponential backoff + jitter, and register an OS-level auto-start service so
-> it survives crashes.
+> Keep `ssh -N` forwardings alive across network drops and reboots — reconnect
+> with exponential backoff + jitter, and register an OS-level auto-start
+> service so it survives crashes.
 
 ## ✦ Features
 
+- 🧭 **All three forwarding kinds** — `[[tunnels]]` rules are tagged by
+  `kind`: `remote` (`-R`, the default), `local` (`-L`) and `dynamic` (`-D`, a
+  SOCKS5 proxy). Mix them freely — they share one SSH connection. Duplicate listen
+  ports are rejected at config load, before `ExitOnForwardFailure` can turn a
+  typo into an endless reconnect loop.
 - 🔁 **Self-healing** — infinite reconnect with exponential backoff + full
   jitter (`max_retries=0` = retry forever), so a drop never becomes a dead
   tunnel. A session that stays up ≥ `stable_after` seconds resets the retry
@@ -67,7 +72,7 @@ import package stay `ponte`; a checkout installs the same way (`pipx install .`)
 | `watch [--interval S]` | live dashboard: health, session uptime, reconnects, event feed |
 | `logs [-n N] [--follow]` | view / tail the daemon log |
 | `test` | quick SSH connectivity check |
-| `check` | verify configured remote ports are listening |
+| `check` | verify tunnel ports are listening (`-R` on the server, `-L`/`-D` locally) |
 | `install` / `uninstall` | register / remove the OS auto-start service |
 | `config` | print the effective configuration, its source file and any warnings |
 
@@ -91,7 +96,7 @@ config instead of silently falling back to another one.
 
 ```
 ponte (local daemon, Python)
-  main.py ──▶ daemon.py ──▶ retry.py ──▶ core.py ──▶ ssh -N -R
+  main.py ──▶ daemon.py ──▶ retry.py ──▶ core.py ──▶ ssh -N (-R/-L/-D)
   (typer     (lifecycle    (infinite    (pure SSH
    CLI)      orchestration) backoff)    subprocess)
                               │
@@ -124,8 +129,13 @@ Sections:
 
 - `[ssh]` — `host` / `port` / `user` / `identity_file` / `known_hosts_file` /
   `options` (any extra key there is passed through verbatim as `-o key=value`)
-- `[[tunnels]]` — reverse rules; the server opens `remote_port`, forwarding
-  back to local `localhost:local_port` (`-R`)
+- `[[tunnels]]` — forwarding rules. `kind` picks the flag and what the fields
+  mean: `remote` (default, `-R`: the server listens on `remote_port` and
+  forwards back to `local_host:local_port`), `local` (`-L`: this machine
+  listens on `local_host:local_port` and forwards to `remote_host:remote_port`)
+  and `dynamic` (`-D`: a SOCKS5 proxy on `local_host:local_port`). For `-L`/`-D`
+  the bind address defaults to `127.0.0.1`, so an omitted field is never a LAN
+  exposure.
 - `[daemon]` — pid/log paths (default per-platform: `%LOCALAPPDATA%\ponte`,
   `~/.local/state/ponte`, `~/Library/Application Support/ponte`), log rotation
 - `[retry]` — `max_retries` (0 = forever), backoff params, `jitter`,
@@ -192,6 +202,10 @@ again. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## ✦ 特性
 
+- 🧭 **三种转发都支持** — `[[tunnels]]` 规则用 `kind` 区分：`remote`（`-R`，默认）、
+  `local`（`-L`）、`dynamic`（`-D`，SOCKS5 代理），可以混用且共用一条 SSH 连接。
+  重复的监听端口在加载配置时就会被拒绝，而不是让 `ExitOnForwardFailure`
+  把一次手误变成无限重连。
 - 🔁 **自愈** — 无限重连 + 指数退避 + 全抖动（`max_retries=0` = 永远重试），
   掉线不会变成死隧道。会话稳定运行 ≥ `stable_after` 秒后重试预算归零，
   长跑隧道不会因前期几次抖动被永久放弃。
@@ -230,7 +244,7 @@ ponte install           # 注册开机自启 + 崩溃重启
 | `watch [--interval S]` | 实时看板：健康、会话时长、重连次数与事件流 |
 | `logs [-n N] [--follow]` | 查看 / 跟读日志 |
 | `test` | 快速测 SSH 连通性 |
-| `check` | 检查各远程端口是否在监听 |
+| `check` | 检查隧道端口（`-R` 在服务器上，`-L`/`-D` 在本机） |
 | `install` / `uninstall` | 注册 / 移除开机自启服务 |
 | `config` | 打印生效配置、来源文件与配置告警 |
 
@@ -253,12 +267,12 @@ ponte install           # 注册开机自启 + 崩溃重启
 
 ```
 ponte（本地守护进程，Python）
-  main.py ──▶ daemon.py ──▶ retry.py ──▶ core.py ──▶ ssh -N -R
+  main.py ──▶ daemon.py ──▶ retry.py ──▶ core.py ──▶ ssh -N（-R/-L/-D）
   (typer     (生命周期     (无限退避     (纯 SSH
    CLI)      编排)         重连)         subprocess)
                               │
                               ▼
-  health.py ── 周期检查：进程存活 + 远程端口
+  health.py ── 周期检查：进程存活 + 远程端口（-R）+ 本地监听（-L/-D）
 ```
 
 - `main.py` — typer 命令行入口
@@ -285,8 +299,12 @@ ponte（本地守护进程，Python）
 
 - `[ssh]` — `host` / `port` / `user` / `identity_file` / `known_hosts_file` /
   `options`（该表内未列出的键会原样透传为 `-o key=value`）
-- `[[tunnels]]` — 反向规则；服务器打开 `remote_port`，转发回本地
-  `localhost:local_port`（`-R`）
+- `[[tunnels]]` — 转发规则。`kind` 决定用哪个转发开关、各字段是什么意思：
+  `remote`（默认，`-R`）服务器监听 `remote_port` 并转发回
+  `local_host:local_port`；`local`（`-L`）本机监听 `local_host:local_port`
+  并转发到服务器侧的 `remote_host:remote_port`；`dynamic`（`-D`）在
+  `local_host:local_port` 上开一个 SOCKS5 代理。`-L`/`-D` 的绑定地址默认
+  `127.0.0.1`，省略字段不会意外暴露到局域网。
 - `[daemon]` — pid/log 路径（平台默认：`%LOCALAPPDATA%\ponte`、
   `~/.local/state/ponte`、`~/Library/Application Support/ponte`）、日志滚动
 - `[retry]` — `max_retries`（0 = 无限）、退避参数、`jitter`、`stable_after`

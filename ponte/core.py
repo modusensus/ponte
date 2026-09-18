@@ -9,12 +9,13 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
 
-from ponte.config import TunnelConfig, get_config
+from ponte.config import WILDCARD_HOSTS, TunnelConfig, get_config
 
 __all__ = ["TunnelManager", "creation_flags"]
 
@@ -103,7 +104,7 @@ def _find_ssh(config: TunnelConfig | None = None) -> str:
 
 
 class TunnelManager:
-    """Manage a single SSH reverse-tunnel session.
+    """Manage a single SSH tunnel session (reverse, local and/or SOCKS).
 
     Parameters:
         config: A validated :class:`TunnelConfig` (from ``ponte.config``).
@@ -222,10 +223,14 @@ class TunnelManager:
     def build_args(self) -> list[str]:
         """Construct the full SSH command line as a list of strings.
 
-        Example::
+        Every configured :class:`~ponte.config.Tunnel` contributes exactly one
+        forwarding flag followed by its spec, so a mixed ``-R``/``-L``/``-D``
+        set becomes a single connection. Example::
 
             ["ssh", "-o", "ServerAliveInterval=30", "-N",
-             "-R", "23334:localhost:2222", "user@server-ip"]
+             "-R", "23334:localhost:2222",
+             "-L", "127.0.0.1:8080:db.internal:5432",
+             "-D", "127.0.0.1:1080", "user@server-ip"]
         """
         cfg = self.config.ssh
         args = [self.ssh_exe]
@@ -248,12 +253,9 @@ class TunnelManager:
         # No shell, just forwarding
         args.append("-N")
 
-        # Reverse tunnels
+        # Forwarding rules: -R (server listens), -L (we listen), -D (SOCKS proxy)
         for tunnel in self.config.tunnels:
-            args.extend([
-                "-R",
-                f"{tunnel.remote_port}:{tunnel.local_host}:{tunnel.local_port}",
-            ])
+            args.extend([tunnel.flag, tunnel.spec])
 
         # Destination
         args.append(cfg.destination)
@@ -294,14 +296,23 @@ class TunnelManager:
             return False
 
     def check_remote_ports(self, timeout: int = 10) -> dict[int, bool]:
-        """Connect to the server and check which tunnel ports are listening.
+        """Connect to the server and check which ``-R`` ports are listening.
 
         The probe runs *on the server*. It prefers a pure-Python socket check
         (no external tools), falling back to ``ss``/``lsof``/``netstat`` for
         servers without python3. Returns a ``{port: is_listening}`` mapping.
+
+        Only ``kind = "remote"`` tunnels have a server-side listening port, so
+        ``-L``/``-D`` rules are skipped here (their local end is covered by the
+        far cheaper :meth:`check_local_ports`). Returns ``{}`` — never a probe
+        connection — when no remote tunnel is configured.
         """
         cfg = self.config.ssh
-        ports = {t.remote_port for t in self.config.tunnels}
+        ports = {
+            int(t.remote_port)
+            for t in self.config.tunnels
+            if t.is_remote and t.remote_port is not None
+        }
         if not ports:
             return {}
 
@@ -364,3 +375,34 @@ class TunnelManager:
             in_tool_output = f":{port} " in output or f":{port}\n" in output
             status[port] = port in python_ports or in_tool_output
         return status
+
+    def check_local_ports(self, timeout: float = 1.0) -> dict[int, bool]:
+        """Check that the local listeners of ``-L`` / ``-D`` tunnels are up.
+
+        A loopback TCP connect — no SSH, no external tool — so unlike the
+        server-side probe it is cheap enough to run on every health tick. A
+        SOCKS proxy (``-D``) accepts a plain TCP connection just like a
+        ``-L`` forward does, so the same probe covers both.
+
+        Returns a ``{port: is_listening}`` mapping; a wildcard bind address
+        (``0.0.0.0`` / ``::``) is probed as loopback, which is reachable
+        whenever the wildcard bind succeeded.
+        """
+        status: dict[int, bool] = {}
+        for tunnel in self.config.tunnels:
+            if tunnel.is_remote:
+                continue
+            host = tunnel.local_host
+            if host in WILDCARD_HOSTS:
+                host = "127.0.0.1"
+            status[tunnel.local_port] = _port_is_open(host, tunnel.local_port, timeout)
+        return status
+
+
+def _port_is_open(host: str, port: int, timeout: float) -> bool:
+    """Return ``True`` if a TCP connect to ``host:port`` succeeds."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False

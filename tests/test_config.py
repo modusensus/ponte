@@ -618,3 +618,186 @@ def test_example_config_ships_with_package() -> None:
     from ponte.config import example_config_path
 
     assert os.path.isfile(example_config_path())
+
+
+# ---------------------------------------------------------------------------
+# 隧道类型：kind = remote / local / dynamic（-R / -L / -D）
+# ---------------------------------------------------------------------------
+
+
+def _tunnels_config(tmp_path, tunnels: str) -> str:
+    """一份最小可用配置，其中 ``[[tunnels]]`` 段由 *tunnels* 决定。"""
+    (tmp_path / "id_rsa").write_text("x", encoding="utf-8")
+    body = f"""
+[ssh]
+host = "example.com"
+user = "testuser"
+identity_file = "{_toml_str(tmp_path / 'id_rsa')}"
+
+{tunnels}
+"""
+    return _write_toml(tmp_path, body)
+
+
+def test_tunnel_kind_defaults_to_remote(tmp_path) -> None:
+    """不写 kind 的旧配置行为完全不变（-R）。"""
+    tunnel = load_config(_minimal(tmp_path)).tunnels[0]
+    assert tunnel.kind == "remote"
+    assert tunnel.is_remote is True
+    assert tunnel.flag == "-R"
+    assert tunnel.spec == "23334:localhost:2222"
+    assert tunnel.remote_host is None
+
+
+def test_local_tunnel_parsed(tmp_path) -> None:
+    """-L：本机监听 local_host:local_port，目标是服务器侧 remote_host:remote_port。"""
+    path = _tunnels_config(
+        tmp_path,
+        """
+[[tunnels]]
+kind = "local"
+local_port = 8080
+remote_host = "db.internal"
+remote_port = 5432
+""",
+    )
+    tunnel = load_config(path).tunnels[0]
+    assert tunnel.kind == "local"
+    assert tunnel.flag == "-L"
+    assert tunnel.local_host == "127.0.0.1"  # 省略时默认只绑本机
+    assert tunnel.spec == "127.0.0.1:8080:db.internal:5432"
+
+
+def test_local_tunnel_requires_remote_host(tmp_path) -> None:
+    """-L 缺 remote_host 必须报错，而不是生成一条语义错误的命令。"""
+    path = _tunnels_config(
+        tmp_path,
+        """
+[[tunnels]]
+kind = "local"
+local_port = 8080
+remote_port = 5432
+""",
+    )
+    with pytest.raises(ConfigValidationError, match="remote_host"):
+        load_config(path)
+
+
+def test_dynamic_tunnel_parsed(tmp_path) -> None:
+    """-D：只需一个本地监听端口，目标由客户端每次连接自行选择。"""
+    path = _tunnels_config(
+        tmp_path,
+        """
+[[tunnels]]
+kind = "dynamic"
+local_port = 1080
+""",
+    )
+    tunnel = load_config(path).tunnels[0]
+    assert tunnel.flag == "-D"
+    assert tunnel.spec == "127.0.0.1:1080"
+    assert tunnel.remote_port is None
+
+
+def test_dynamic_tunnel_reports_ignored_remote_keys(tmp_path) -> None:
+    """-D 上写 remote_* 是误解：记一条告警，而不是静默丢弃。"""
+    path = _tunnels_config(
+        tmp_path,
+        """
+[[tunnels]]
+kind = "dynamic"
+local_port = 1080
+remote_host = "ignored.example"
+remote_port = 9999
+""",
+    )
+    cfg = load_config(path)
+    assert cfg.tunnels[0].remote_host is None
+    assert any("已忽略" in warning for warning in cfg.warnings)
+
+
+def test_unknown_tunnel_kind_rejected(tmp_path) -> None:
+    path = _tunnels_config(
+        tmp_path,
+        """
+[[tunnels]]
+kind = "socks"
+local_port = 1080
+""",
+    )
+    with pytest.raises(ConfigValidationError, match="kind"):
+        load_config(path)
+
+
+def test_remote_bind_address_is_opt_in(tmp_path) -> None:
+    """-R 的 remote_host 是服务器侧绑定地址（GatewayPorts 场景），不写就不加。"""
+    path = _tunnels_config(
+        tmp_path,
+        """
+[[tunnels]]
+remote_port = 23334
+local_host = "localhost"
+local_port = 2222
+remote_host = "0.0.0.0"
+""",
+    )
+    assert load_config(path).tunnels[0].spec == "0.0.0.0:23334:localhost:2222"
+
+
+def test_duplicate_remote_ports_rejected(tmp_path) -> None:
+    """同一服务器端口写两遍会让 ssh 直接断开整条连接（ExitOnForwardFailure）。"""
+    path = _tunnels_config(
+        tmp_path,
+        """
+[[tunnels]]
+remote_port = 23334
+local_host = "localhost"
+local_port = 2222
+
+[[tunnels]]
+remote_port = 23334
+local_host = "localhost"
+local_port = 3333
+""",
+    )
+    with pytest.raises(ConfigValidationError, match="remote port 23334"):
+        load_config(path)
+
+
+def test_duplicate_local_listeners_rejected(tmp_path) -> None:
+    """-L 与 -D 都在本机监听，端口撞车同样要提前拒绝。"""
+    path = _tunnels_config(
+        tmp_path,
+        """
+[[tunnels]]
+kind = "local"
+local_port = 8080
+remote_host = "db.internal"
+remote_port = 5432
+
+[[tunnels]]
+kind = "dynamic"
+local_port = 8080
+""",
+    )
+    with pytest.raises(ConfigValidationError, match="listen on"):
+        load_config(path)
+
+
+def test_same_port_on_both_sides_is_not_a_conflict(tmp_path) -> None:
+    """服务器端口与本机端口是两个命名空间，同号不算冲突。"""
+    path = _tunnels_config(
+        tmp_path,
+        """
+[[tunnels]]
+remote_port = 8080
+local_host = "localhost"
+local_port = 2222
+
+[[tunnels]]
+kind = "dynamic"
+local_port = 8080
+""",
+    )
+    cfg = load_config(path)
+    assert [tunnel.kind for tunnel in cfg.tunnels] == ["remote", "dynamic"]
