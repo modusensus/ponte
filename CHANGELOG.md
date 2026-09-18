@@ -35,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `name = "ponte-cli"`. The import package (`ponte`), the console command
   (`ponte`) and the repository name are unchanged, so an install from a
   checkout behaves exactly as before.
+- **The coverage gate moved from 70% to 80%.** The `[[profiles]]`, notify and
+  doctor work pushed the suite past it (~83%), so the threshold in `pyproject.toml`
+  now matches the codebase instead of trailing it by ten points.
 
 ### Added
 
@@ -82,12 +85,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Publishing (OIDC, no stored token). It refuses a tag that does not match the
   version in `ponte/__init__.py`, and verifies the wheel's distribution name and
   contents (`config.example.toml`) before uploading.
+- **Out-of-band alerts when a tunnel really is down (`[notify]`).** A tunnel
+  whose reconnect attempts keep failing no longer only writes to a log nobody
+  reads: after `on_consecutive_failures` failed attempts in a row the daemon
+  pushes to an ntfy topic and/or a JSON webhook. "Recovered" is judged by the
+  same `[retry] stable_after` rule the reconnect budget uses, so a flapping
+  tunnel re-arms and reports the next outage; `cooldown` rate-limits a single
+  outage to one message per window, and at most one alert is attempted per
+  outage, so a reconnect loop cannot become a flood of HTTP requests. Delivery
+  failures are recorded (never raised) and surfaced by `ponte doctor`, and
+  `ponte notify-test` sends a real test message so the channel can be proven
+  before the outage that matters.
+- **`ponte doctor` — one-command health checkup.** Walks the whole path a user
+  actually hits: effective config (and its warnings), the `ssh` client, the
+  identity file and its POSIX permissions, SSH reachability per profile, remote
+  and local listen ports, daemon/service state and the notify channel. Every
+  row carries a verdict plus a concrete fix (the command to run, the file to
+  edit), `--offline` skips everything that needs the network, and the exit code
+  is non-zero when anything failed, so it is usable from a script.
 - `[windows] pythonw_exe` — pin the windowless interpreter for the Scheduled
   Task, for installs where `pythonw.exe` does not sit next to `python.exe`.
 
 ### Planned
 
-- Coverage threshold raised from 70% to 80% (needs more `daemon.run()` tests).
 - `ruff format --check` in CI once the tree is formatted.
 
 ## [0.3.0] - 2026-09-12

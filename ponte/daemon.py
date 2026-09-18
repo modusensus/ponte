@@ -39,6 +39,7 @@ from xml.sax.saxutils import escape as xml_escape
 from ponte.config import DEFAULT_PROFILE_NAME, Profile, TunnelConfig, get_config
 from ponte.core import TunnelManager, creation_flags
 from ponte.health import HealthChecker, HealthStatus
+from ponte.notify import Notification, Notifier
 from ponte.retry import RetryEvent, RetryRunner
 
 __all__ = ["DaemonStatus", "ProfileRunner", "ProfileStatus", "TunnelDaemon"]
@@ -80,10 +81,24 @@ _PROFILE_KEYS = frozenset(
         "current_session_at",
         "last_disconnect_at",
         "last_disconnect_reason",
+        "last_notification_at",
         "recent_events",
         "error",
     }
 )
+
+
+def _disconnect_reason(event: RetryEvent) -> str:
+    """Human-readable reason for a ``DISCONNECTED`` event.
+
+    Shared by the statistics bookkeeping and the failure alert so the two can
+    never disagree about *why* a tunnel dropped.
+    """
+    if event.error:
+        return str(event.error)
+    if event.exit_code is not None:
+        return f"ssh exited with code {event.exit_code}"
+    return "unknown"
 
 #: Thread join timeout when shutting a profile down (seconds).
 _PROFILE_JOIN_TIMEOUT = 10.0
@@ -201,6 +216,8 @@ class ProfileStatus:
     last_disconnect_at: float | None = None
     #: Human-readable reason of the most recent disconnect.
     last_disconnect_reason: str | None = None
+    #: Wall-clock time the most recent failure alert was delivered.
+    last_notification_at: float | None = None
     #: Bounded feed of recent retry-loop events (oldest first).
     recent_events: list[dict] = dataclasses.field(default_factory=list)
 
@@ -322,6 +339,7 @@ def _profile_status(name: str, section: dict) -> ProfileStatus:
         current_session_at=_number("current_session_at"),
         last_disconnect_at=_number("last_disconnect_at"),
         last_disconnect_reason=section.get("last_disconnect_reason"),
+        last_notification_at=_number("last_notification_at"),
         recent_events=[
             dict(event)
             for event in section.get("recent_events", [])
@@ -462,10 +480,15 @@ class ProfileRunner:
             retry_runner if retry_runner is not None else RetryRunner(config.retry)
         )
         self.health = HealthChecker(self.manager, config.health)
+        self.notifier = daemon.notifier
         self.health_stop: threading.Event | None = None
         self.thread: threading.Thread | None = None
         #: Message of an unexpected exception that killed this profile's loop.
         self.error: str | None = None
+        # Consecutive failed attempts, and whether this outage was already
+        # reported (see ``_note_disconnect``).
+        self._failures = 0
+        self._alerted = False
 
     # -- Lifecycle ---------------------------------------------------------
 
@@ -524,6 +547,7 @@ class ProfileRunner:
                         event.exit_code,
                         event.error,
                     )
+                    self._note_disconnect(_disconnect_reason(event))
                 elif event.type == RetryEvent.RETRYING:
                     log.warning(
                         "[%s] reconnecting attempt %d in %.1fs",
@@ -546,6 +570,40 @@ class ProfileRunner:
     def _on_health(self, status: HealthStatus) -> None:
         """Persist this profile's health and force-reconnect a zombie session."""
         self.daemon._on_health(status, self.manager, self.profile.name)
+
+    def _note_disconnect(self, reason: str) -> None:
+        """Count consecutive failures and alert once past the threshold.
+
+        A session that stayed up for ``[retry] stable_after`` seconds counts as
+        recovery — the same rule the reconnect budget uses — and re-arms the
+        alert so the *next* outage is reported again.
+
+        At most one alert per outage: whether the message was delivered,
+        suppressed by the cooldown, or failed to send, ``_alerted`` stays set
+        until a stable session, so a flapping tunnel cannot turn into a flood
+        of HTTP requests (one per reconnect attempt).
+        """
+        duration = getattr(self.manager, "last_session_duration", None)
+        if duration is not None and duration >= self.config.retry.stable_after:
+            self._failures = 0
+            self._alerted = False
+            return
+
+        self._failures += 1
+        threshold = self.config.notify.on_consecutive_failures
+        if self._alerted or self._failures < threshold or not self.notifier.enabled:
+            return
+        self._alerted = True
+        delivered = self.notifier.notify(
+            Notification(
+                profile=self.profile.name,
+                failures=self._failures,
+                reason=reason,
+                destination=self.profile.destination,
+            )
+        )
+        if delivered:
+            self.daemon._record_notification(self.profile.name)
 
 
 class TunnelDaemon:
@@ -570,6 +628,9 @@ class TunnelDaemon:
         self.stop_marker = _derive_stop_marker(self.pid_file)
         self._store = _StatusStore(self.status_file)
         self._shutdown = threading.Event()
+        #: Shared by every profile: the channels and the rate limit are policy,
+        #: not per-connection state.
+        self.notifier = Notifier(self.config.notify)
         # Per-profile in-memory bookkeeping, keyed by profile name.
         self._last_health: dict[str, HealthStatus] = {}
         # Wall-clock time of the most recent DISCONNECTED of a profile whose
@@ -739,12 +800,7 @@ class TunnelDaemon:
         now = time.time()
         reason: str | None = None
         if event.type == RetryEvent.DISCONNECTED:
-            if event.error:
-                reason = event.error
-            elif event.exit_code is not None:
-                reason = f"ssh exited with code {event.exit_code}"
-            else:
-                reason = "unknown"
+            reason = _disconnect_reason(event)
 
         with self._store.edit(profile) as section:
             attempts = int(section.get("connect_attempts_total", 0))
@@ -896,6 +952,11 @@ class TunnelDaemon:
         """Record that a profile's loop died, so ``status`` can surface it."""
         with self._store.edit(profile) as section:
             section["error"] = message
+
+    def _record_notification(self, profile: str) -> None:
+        """Stamp the moment *profile*'s failure alert was delivered."""
+        with self._store.edit(profile) as section:
+            section["last_notification_at"] = time.time()
 
     def _watch_stop_marker(self, request_stop: Callable[[str], None]) -> None:
         """Watch for a stop marker file and request a graceful shutdown."""
@@ -1124,6 +1185,34 @@ class TunnelDaemon:
         if sys.platform == "darwin":
             return self._uninstall_launchd()
         raise RuntimeError(f"service uninstall not supported on {sys.platform}")
+
+    def service_installed(self) -> bool | None:
+        """Best-effort: is the auto-start service registered for this config?
+
+        Used by ``ponte doctor``. ``None`` means "cannot tell" (unknown
+        platform, or the query tool is not installed) — which the caller must
+        report as unknown rather than as "not installed", because those two
+        need completely different fixes.
+        """
+        try:
+            if sys.platform == "win32":
+                result = _run_tool(
+                    ["schtasks", "/Query", "/TN", self.config.windows.task_name],
+                    timeout=15,
+                )
+                return result.returncode == 0
+            if sys.platform == "linux":
+                name = self.config.service.name
+                result = _run_tool(
+                    ["systemctl", "--user", "is-enabled", f"{name}.service"],
+                    timeout=15,
+                )
+                return result.returncode == 0
+            if sys.platform == "darwin":
+                return os.path.exists(self._launchd_plist())
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.debug("could not query the service state: %s", exc)
+        return None
 
     def _stop_autostart(self) -> None:
         """Best-effort: stop the auto-start hook so it cannot respawn us."""

@@ -47,6 +47,15 @@
   ports down) is force-reconnected after 3 consecutive failed checks, and
   checks back off exponentially during outages so the server's `MaxStartups`
   is never hammered.
+- 🔔 **It tells you when it breaks** — after `[notify].on_consecutive_failures`
+  failed attempts in a row, ponte pushes to an ntfy topic and/or a JSON webhook,
+  at most once per `cooldown` for the same tunnel, and re-arms only after a
+  session that stays up ≥ `stable_after` seconds. `ponte notify-test` proves the
+  channel works *before* the outage. Off by default: nothing leaves your machine
+  unless you enable it.
+- 🩺 **`ponte doctor`** — one command that checks the config, the key file and
+  its permissions, SSH reachability, listening ports, auto-start status and the
+  notify channel, each row ending in a concrete fix instead of a black box.
 - 🖥️ **Cross-platform** — resolves `ssh` automatically, per-platform runtime
   paths, and portable remote-port probing (`socket` → `ss`/`lsof`/`netstat`).
 
@@ -79,6 +88,8 @@ import package stay `ponte`; a checkout installs the same way (`pipx install .`)
 | `logs [-n N] [--follow]` | view / tail the daemon log |
 | `test [--profile NAME]` | quick SSH connectivity check (every profile by default) |
 | `check [--profile NAME]` | verify tunnel ports are listening (`-R` on the server, `-L`/`-D` locally) |
+| `doctor [--offline] [--timeout S]` | one-shot checkup of config, key, connectivity, ports, auto-start and notifications, each row with a fix |
+| `notify-test [--profile NAME]` | send a test alert through the configured ntfy / webhook channels |
 | `install` / `uninstall` | register / remove the OS auto-start service |
 | `config` | print the effective configuration, its source file and any warnings |
 
@@ -115,6 +126,8 @@ ponte (local daemon, Python)
 - `retry.py` — exponential backoff + jitter reconnect state machine
 - `core.py` — SSH argument building, subprocess management, port probing
 - `health.py` — periodic liveness + remote-port checks
+- `notify.py` — ntfy / webhook alerts on repeated failures
+- `doctor.py` — one-shot diagnostics used by `ponte doctor`
 - `config.py` — TOML load/validate (built-in `tomllib` on 3.11+)
 
 ## ⚙️ Configuration
@@ -152,6 +165,10 @@ Sections:
   `stable_after`
 - `[health]` — check interval, remote probe toggle/timeout,
   `max_check_interval` (backoff ceiling while unhealthy)
+- `[notify]` — `enabled` (default `false`), `on_consecutive_failures`,
+  `cooldown` (seconds between two alerts for the same profile), and the
+  channels: `ntfy_topic` (plus optional `ntfy_server` / `ntfy_token`) and/or
+  `webhook_url`, which receives the alert as JSON
 - `[service]` — service name, autostart, POSIX kill grace
 - `[windows]` — Windows-only knobs (`task_name`, `ssh_exe`, `pythonw_exe`,
   `run_as`). `run_as` is `user` (default: logon-time, runs as you, can read
@@ -228,6 +245,12 @@ again. See [CONTRIBUTING.md](CONTRIBUTING.md).
 - 💚 **健康检查** — 周期探测本地进程存活 + 远程端口，异常给出明确诊断。
   SSH 进程假死（活着但端口全掉）时连续 3 次检查失败即强制重连；检查失败
   指数退避，不会高频新开 SSH 触发服务器 `MaxStartups`。
+- 🔔 **真断了会主动告诉你** — 连续 `[notify].on_consecutive_failures` 次失败后，
+  向 ntfy 主题和/或 JSON webhook 推送一条告警；同一隧道每个 `cooldown` 秒最多
+  一条，且只有会话稳定运行 ≥ `stable_after` 秒才重新武装。`ponte notify-test`
+  让你在真出事**之前**就验证通道可用。默认关闭：不开启就绝不会外发任何数据。
+- 🩺 **`ponte doctor`** — 一条命令逐项体检：配置、密钥及其权限、SSH 连通性、
+  监听端口、开机自启状态、通知通道，每行都给出具体修法而不是留个黑箱。
 - 🖥️ **跨平台** — 自动查找 `ssh`、按平台落盘运行时文件、可移植的远程端口探测
   （`socket` → `ss`/`lsof`/`netstat`）。
 
@@ -259,6 +282,8 @@ ponte install           # 注册开机自启 + 崩溃重启
 | `logs [-n N] [--follow]` | 查看 / 跟读日志 |
 | `test [--profile NAME]` | 快速测 SSH 连通性（默认逐条测试） |
 | `check [--profile NAME]` | 检查隧道端口（`-R` 在服务器上，`-L`/`-D` 在本机） |
+| `doctor [--offline] [--timeout S]` | 一键体检配置、密钥、连通性、端口、自启与通知，每项给出修法 |
+| `notify-test [--profile NAME]` | 通过已配置的 ntfy / webhook 通道发一条测试通知 |
 | `install` / `uninstall` | 注册 / 移除开机自启服务 |
 | `config` | 打印生效配置、来源文件与配置告警 |
 
@@ -298,6 +323,8 @@ ponte（本地守护进程，Python）
 - `retry.py` — 指数退避 + 抖动重连状态机
 - `core.py` — SSH 参数构建、子进程管理、端口探测
 - `health.py` — 周期存活 + 远程端口检查
+- `notify.py` — 连续失败时的 ntfy / webhook 告警
+- `doctor.py` — `ponte doctor` 使用的体检项
 - `config.py` — TOML 加载/校验（3.11+ 内置 `tomllib`）
 
 ## ⚙️ 配置
@@ -332,6 +359,10 @@ ponte（本地守护进程，Python）
 - `[retry]` — `max_retries`（0 = 无限）、退避参数、`jitter`、`stable_after`
 - `[health]` — 检查间隔、远程探测开关/超时、`max_check_interval`
   （不健康期间的间隔退避上限）
+- `[notify]` — `enabled`（默认 `false`）、`on_consecutive_failures`、
+  `cooldown`（同一 profile 两条告警之间的最小秒数），以及通道：
+  `ntfy_topic`（可选 `ntfy_server` / `ntfy_token`）和/或 `webhook_url`
+  （以 JSON 形式收到告警）
 - `[service]` — 服务名、自启、POSIX 强杀等待
 - `[windows]` — 仅 Windows 使用（`task_name`、`ssh_exe`、`pythonw_exe`、
   `run_as`）。`run_as` 默认 `user`（登录后以你本人身份运行、能读 `~/.ssh`）或

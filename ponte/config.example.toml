@@ -126,6 +126,23 @@ remote_check_enabled = true
 remote_check_timeout = 10  # 单次远程探测超时（秒）
 max_check_interval = 300   # 连续失败时检查间隔的退避上限（秒）
 
+[notify]
+# 隧道连续掉线时主动告警。默认关闭：不开就不会外发任何数据。
+enabled = false
+# 连续失败多少次后告警。会话稳定运行 >= stable_after 秒算「恢复」，
+# 计数归零并重新武装，所以下一次故障会再报一次。
+on_consecutive_failures = 3
+# 同一 profile 两条告警之间的最小间隔（秒）。一夜断线 = 每个窗口一条，
+# 而不是每次重连都发。
+cooldown = 900
+# 通道一：ntfy（app 或自建服务都能收）。topic 留空即不用该通道。
+# ntfy_topic = "ponte-alerts-你的随机后缀"
+# ntfy_server = "https://ntfy.sh"
+# ntfy_token = "tk_xxxxxxxx"   # 受保护主题才需要
+# 通道二：通用 webhook，告警以 JSON POST 过去（企业微信/飞书/Slack 中转都行）。
+# webhook_url = "https://example.com/hooks/ponte"
+# 两个通道可以同时配。配好后用 `ponte notify-test` 验证真能收到。
+
 [service]
 # 开机自启服务身份（Linux systemd 单元名 / macOS launchd label 后缀）
 name = "ponte"
