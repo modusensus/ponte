@@ -30,6 +30,12 @@
   SOCKS5 proxy). Mix them freely — they share one SSH connection. Duplicate listen
   ports are rejected at config load, before `ExitOnForwardFailure` can turn a
   typo into an endless reconnect loop.
+- 🧵 **Many tunnels, one daemon** — `[[profiles]]` gives each SSH endpoint a
+  name, its own key and its own forwarding rules. Every profile is supervised
+  independently (own connection, reconnect budget, health checks and status
+  file section), so one unreachable server no longer drags the others down,
+  and `ponte status` / `ponte watch` have a row per tunnel. A pre-`profiles`
+  config is read as a single profile named `default`.
 - 🔁 **Self-healing** — infinite reconnect with exponential backoff + full
   jitter (`max_retries=0` = retry forever), so a drop never becomes a dead
   tunnel. A session that stays up ≥ `stable_after` seconds resets the retry
@@ -68,11 +74,11 @@ import package stay `ponte`; a checkout installs the same way (`pipx install .`)
 | `init [--path P] [--force]` | write a config file from the template (never overwrites without `--force`) |
 | `start` / `start --foreground` | start daemon in background / foreground (debug) |
 | `stop` / `restart` | graceful stop / stop-then-start |
-| `status [--json]` | local process + remote port + tunnel statistics (`--json` for scripts) |
-| `watch [--interval S]` | live dashboard: health, session uptime, reconnects, event feed |
+| `status [--json]` | per-profile health, ports and tunnel statistics (`--json` for scripts) |
+| `watch [--interval S]` | live dashboard: per-profile health, session uptime, reconnects, event feed |
 | `logs [-n N] [--follow]` | view / tail the daemon log |
-| `test` | quick SSH connectivity check |
-| `check` | verify tunnel ports are listening (`-R` on the server, `-L`/`-D` locally) |
+| `test [--profile NAME]` | quick SSH connectivity check (every profile by default) |
+| `check [--profile NAME]` | verify tunnel ports are listening (`-R` on the server, `-L`/`-D` locally) |
 | `install` / `uninstall` | register / remove the OS auto-start service |
 | `config` | print the effective configuration, its source file and any warnings |
 
@@ -129,6 +135,10 @@ Sections:
 
 - `[ssh]` — `host` / `port` / `user` / `identity_file` / `known_hosts_file` /
   `options` (any extra key there is passed through verbatim as `-o key=value`)
+- `[[profiles]]` — an alternative to the single-tunnel layout: each entry has
+  `name`, its own `[profiles.ssh]` and its own `[[profiles.tunnels]]`. Mixed
+  with a top-level `[ssh]`/`[[tunnels]]` it is rejected rather than guessed at;
+  `retry`/`health`/`daemon`/`service` stay global policy for every profile.
 - `[[tunnels]]` — forwarding rules. `kind` picks the flag and what the fields
   mean: `remote` (default, `-R`: the server listens on `remote_port` and
   forwards back to `local_host:local_port`), `local` (`-L`: this machine
@@ -202,6 +212,10 @@ again. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## ✦ 特性
 
+- 🧵 **一个守护进程，多条隧道** — `[[profiles]]` 给每个 SSH 端点一个名字、
+  一套密钥和一组转发规则；每条 profile 各自重连、各自健康检查、在状态文件里
+  各占一段，所以一台服务器连不上不会拖垮其它隧道，`ponte status` / `ponte watch`
+  也是每条隧道一行。升级前的单隧道配置会被当作名为 `default` 的 profile 读取。
 - 🧭 **三种转发都支持** — `[[tunnels]]` 规则用 `kind` 区分：`remote`（`-R`，默认）、
   `local`（`-L`）、`dynamic`（`-D`，SOCKS5 代理），可以混用且共用一条 SSH 连接。
   重复的监听端口在加载配置时就会被拒绝，而不是让 `ExitOnForwardFailure`
@@ -240,11 +254,11 @@ ponte install           # 注册开机自启 + 崩溃重启
 | `init [--path P] [--force]` | 从模板生成配置文件（不加 `--force` 不覆盖） |
 | `start` / `start --foreground` | 后台启动 / 前台启动（调试） |
 | `stop` / `restart` | 优雅停止 / 停旧起新 |
-| `status [--json]` | 本地进程 + 远程端口 + 隧道统计（`--json` 供脚本消费） |
-| `watch [--interval S]` | 实时看板：健康、会话时长、重连次数与事件流 |
+| `status [--json]` | 逐条隧道的健康、端口与统计（`--json` 供脚本消费） |
+| `watch [--interval S]` | 实时看板：每条隧道一栏，含会话时长、重连次数与事件流 |
 | `logs [-n N] [--follow]` | 查看 / 跟读日志 |
-| `test` | 快速测 SSH 连通性 |
-| `check` | 检查隧道端口（`-R` 在服务器上，`-L`/`-D` 在本机） |
+| `test [--profile NAME]` | 快速测 SSH 连通性（默认逐条测试） |
+| `check [--profile NAME]` | 检查隧道端口（`-R` 在服务器上，`-L`/`-D` 在本机） |
 | `install` / `uninstall` | 注册 / 移除开机自启服务 |
 | `config` | 打印生效配置、来源文件与配置告警 |
 
@@ -275,6 +289,10 @@ ponte（本地守护进程，Python）
   health.py ── 周期检查：进程存活 + 远程端口（-R）+ 本地监听（-L/-D）
 ```
 
+一个守护进程为每个 `[[profiles]]` 建一个 `ProfileRunner`（各自的 SSH 会话、
+重连循环、健康检查），进程级的 pid / 状态文件 / 服务注册由守护进程统一持有；
+状态文件按 profile 分区，所以一条隧道挂了不会影响其它隧道。
+
 - `main.py` — typer 命令行入口
 - `daemon.py` — 生命周期编排、服务安装/卸载、优雅停止
 - `retry.py` — 指数退避 + 抖动重连状态机
@@ -299,6 +317,10 @@ ponte（本地守护进程，Python）
 
 - `[ssh]` — `host` / `port` / `user` / `identity_file` / `known_hosts_file` /
   `options`（该表内未列出的键会原样透传为 `-o key=value`）
+- `[[profiles]]` — 单隧道写法的替代品：每个条目有 `name`、自己的
+  `[profiles.ssh]` 与 `[[profiles.tunnels]]`。与顶层 `[ssh]`/`[[tunnels]]`
+  混用会被拒绝（而不是猜你的意图）；`retry`/`health`/`daemon`/`service`
+  仍是所有 profile 共用的全局策略。
 - `[[tunnels]]` — 转发规则。`kind` 决定用哪个转发开关、各字段是什么意思：
   `remote`（默认，`-R`）服务器监听 `remote_port` 并转发回
   `local_host:local_port`；`local`（`-L`）本机监听 `local_host:local_port`

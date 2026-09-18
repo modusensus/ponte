@@ -16,10 +16,11 @@ import types
 
 import pytest
 
-from ponte.config import SSHConfig, Tunnel, TunnelConfig, WindowsConfig
+from ponte.config import Profile, SSHConfig, Tunnel, TunnelConfig, WindowsConfig
 from ponte.core import creation_flags
 from ponte.daemon import (
     DaemonStatus,
+    ProfileRunner,
     TunnelDaemon,
     _decode_console,
     _derive_status_file,
@@ -31,15 +32,34 @@ from ponte.health import HealthStatus
 from ponte.retry import RetryEvent
 
 
+def _section(d, profile: str = "default") -> dict:
+    """The status-file section of *profile* (the file is keyed by profile)."""
+    return d._store.read_profiles().get(profile, {})
+
+
+def _write_status_file(d, payload: dict) -> None:
+    """Seed a raw status payload; tests write the file the daemon will read."""
+    os.makedirs(os.path.dirname(d.status_file), exist_ok=True)
+    with open(d.status_file, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh)
+
+
 def _cfg(tmp_path, *, run_as: str = "system") -> TunnelConfig:
     return TunnelConfig(
-        ssh=SSHConfig(
-            host="example.com",
-            user="testuser",
-            identity_file="/keys/id_rsa",
-            known_hosts_file="/keys/known_hosts",
-        ),
-        tunnels=[Tunnel(remote_port=23334, local_host="localhost", local_port=2222)],
+        profiles=[
+            Profile(
+                name="default",
+                ssh=SSHConfig(
+                    host="example.com",
+                    user="testuser",
+                    identity_file="/keys/id_rsa",
+                    known_hosts_file="/keys/known_hosts",
+                ),
+                tunnels=[
+                    Tunnel(remote_port=23334, local_host="localhost", local_port=2222)
+                ],
+            )
+        ],
         daemon=__import__("ponte.config", fromlist=["DaemonConfig"]).DaemonConfig(
             pid_file=str(tmp_path / "ponte.pid"),
             log_file=str(tmp_path / "ponte.log"),
@@ -99,15 +119,43 @@ def test_status_json_parsing(tmp_path) -> None:
     # 伪造一个存活 pid 的 status 文件：用当前进程
     with open(cfg.daemon.pid_file, "w", encoding="utf-8") as fh:
         fh.write(str(os.getpid()))
-    with open(d.status_file, "w", encoding="utf-8") as fh:
-        json.dump(
-            {"started_at": time.time(), "healthy": True, "remote_ports": {"23334": True}},
-            fh,
-        )
+    _write_status_file(
+        d,
+        {
+            "started_at": time.time(),
+            "profiles": {
+                "default": {"healthy": True, "remote_ports": {"23334": True}},
+                "offsite": {"healthy": False},
+            },
+        },
+    )
     s = d.status()
     assert s.running is True
+    assert [p.name for p in s.profiles] == ["default", "offsite"]
+    assert s.profiles[0].healthy is True
+    assert s.profiles[0].remote_ports == {23334: True}
+    assert s.profiles[1].healthy is False
+    assert s.profiles[1].remote_ports == {}
+    # 任一 profile 不健康 → 整体不健康。
+    assert s.healthy is False
+    assert s.get_profile("offsite") is s.profiles[1]
+    assert s.get_profile("nowhere") is None
+
+
+def test_status_reads_pre_profile_status_file(tmp_path) -> None:
+    """升级前写的扁平状态文件被当作 default profile 读取（原地升级不丢历史）。"""
+    cfg = _cfg(tmp_path)
+    d = TunnelDaemon(cfg)
+    _live_pid(tmp_path)
+    _write_status_file(
+        d,
+        {"started_at": time.time(), "healthy": True, "remote_ports": {"23334": True}},
+    )
+    s = d.status()
+    assert [p.name for p in s.profiles] == ["default"]
+    assert s.profiles[0].healthy is True
+    assert s.profiles[0].remote_ports == {23334: True}
     assert s.healthy is True
-    assert s.remote_ports == {23334: True}
 
 
 class _DurationManager:
@@ -313,28 +361,39 @@ def test_on_health_writes_status(tmp_path) -> None:
             timestamp=time.time(),
         )
     )
-    data = d._read_status_json()
-    assert data["process_alive"] is True
-    assert data["healthy"] is True
-    assert data["remote_ports"] == {"23334": True}
+    section = _section(d)
+    assert section["process_alive"] is True
+    assert section["healthy"] is True
+    assert section["remote_ports"] == {"23334": True}
+    assert section["local_ports"] == {}
 
 
-def test_read_status_json_missing_returns_empty(tmp_path) -> None:
+def test_on_health_is_per_profile(tmp_path) -> None:
+    """每个 profile 写各自的 section，互不覆盖。"""
+    d = TunnelDaemon(_cfg(tmp_path))
+    d._on_health(_healthy_status(), profile="default")
+    d._on_health(_unhealthy_status(), profile="offsite")
+    assert _section(d, "default")["healthy"] is True
+    assert _section(d, "offsite")["healthy"] is False
+    assert set(d._store.read_profiles()) == {"default", "offsite"}
+
+
+def test_read_status_missing_returns_empty(tmp_path) -> None:
     cfg = _cfg(tmp_path)
     d = TunnelDaemon(cfg)
-    assert d._read_status_json() == {}
+    assert d._store.read_profiles() == {}
 
 
-def test_read_status_json_invalid_returns_empty(tmp_path) -> None:
+def test_read_status_invalid_returns_empty(tmp_path) -> None:
     cfg = _cfg(tmp_path)
     d = TunnelDaemon(cfg)
     os.makedirs(os.path.dirname(d.status_file), exist_ok=True)
     with open(d.status_file, "w", encoding="utf-8") as fh:
         fh.write("not json")
-    assert d._read_status_json() == {}
+    assert d._store.read_profiles() == {}
 
 
-def test_write_status_json_failure_silent(tmp_path, monkeypatch) -> None:
+def test_write_status_failure_silent(tmp_path, monkeypatch) -> None:
     cfg = _cfg(tmp_path)
     d = TunnelDaemon(cfg)
 
@@ -342,7 +401,8 @@ def test_write_status_json_failure_silent(tmp_path, monkeypatch) -> None:
         raise OSError("disk full")
 
     monkeypatch.setattr("builtins.open", _bad_open)
-    d._write_status_json({"x": 1})  # 不应抛出
+    with d._store.edit("default") as section:  # 不应抛出
+        section["x"] = 1
 
 
 class _FakeManager:
@@ -442,7 +502,7 @@ def test_record_retry_event_full_session(tmp_path) -> None:
     manager = _DurationManager([120.0])
 
     d._record_retry_event(RetryEvent.connecting(), manager)
-    data = d._read_status_json()
+    data = _section(d)
     assert data["connect_attempts_total"] == 1
     assert data["sessions_total"] == 0
     assert data["current_session_at"] is not None
@@ -451,7 +511,7 @@ def test_record_retry_event_full_session(tmp_path) -> None:
     manager.calls = 1  # connect() 返回 → 会话时长变为可读
     d._record_retry_event(RetryEvent.connected(), manager)
     d._record_retry_event(RetryEvent.disconnected(0), manager)
-    data = d._read_status_json()
+    data = _section(d)
     assert data["sessions_total"] == 1
     assert data["tunnel_uptime_seconds"] == 120.0
     assert data["current_session_at"] is None
@@ -463,12 +523,12 @@ def test_record_retry_event_full_session(tmp_path) -> None:
 
     # RETRYING：重连计数 +1，downtime 在下一次 CONNECTING 时闭合。
     d._record_retry_event(RetryEvent.retrying(3.5, 1), manager)
-    data = d._read_status_json()
+    data = _section(d)
     assert data["reconnects_total"] == 1
     assert data["tunnel_downtime_seconds"] == 0.0  # 尚未闭合
 
     d._record_retry_event(RetryEvent.connecting(), manager)
-    data = d._read_status_json()
+    data = _section(d)
     assert data["connect_attempts_total"] == 2
     assert data["tunnel_downtime_seconds"] >= 0.0
     assert data["current_session_at"] is not None
@@ -492,7 +552,7 @@ def test_record_retry_event_launch_failure(tmp_path) -> None:
     d._record_retry_event(
         RetryEvent.disconnected(None, error="OSError: ssh not found"), manager
     )
-    data = d._read_status_json()
+    data = _section(d)
     assert data["sessions_total"] == 0
     assert data["tunnel_uptime_seconds"] == 0.0
     assert data["last_disconnect_reason"] == "OSError: ssh not found"
@@ -510,7 +570,7 @@ def test_record_retry_event_feed_is_bounded(tmp_path) -> None:
     for _ in range(_EVENT_FEED_LIMIT + 10):
         d._record_retry_event(RetryEvent.connecting(), manager)
         d._record_retry_event(RetryEvent.disconnected(1), manager)
-    data = d._read_status_json()
+    data = _section(d)
     assert len(data["recent_events"]) == _EVENT_FEED_LIMIT
     # 最老的事件被淘汰：剩余的最后一条应是最后一轮 disconnected。
     assert data["recent_events"][-1]["type"] == "disconnected"
@@ -519,76 +579,262 @@ def test_record_retry_event_feed_is_bounded(tmp_path) -> None:
 def test_stats_survive_daemon_restart(tmp_path) -> None:
     """run() 前置合并不清零历史统计（守护进程被服务拉起时保住历史）。
 
-    直接调用合并逻辑等价片段：预先写一份带统计的状态文件，再模拟 run() 的
-    setdefault 合并路径（run() 本身需要 mock 整个 retry/health 循环，这里只
-    验证合并语义不改数据的部分）。
+    走真实的 ``_StatusStore.begin()`` 路径：run() 本身要 mock 整个
+    retry/health 循环，而这里要验证的正是它的第一步——合并不覆盖。
     """
     d = TunnelDaemon(_cfg(tmp_path))
-    d._write_status_json(
+    _write_status_file(
+        d,
         {
             "started_at": 1.0,
-            "sessions_total": 7,
-            "connect_attempts_total": 9,
-            "reconnects_total": 2,
-            "tunnel_uptime_seconds": 3600.0,
-            "tunnel_downtime_seconds": 30.0,
-            "recent_events": [{"at": 1.0, "type": "connected"}],
-        }
+            "profiles": {
+                "default": {
+                    "sessions_total": 7,
+                    "connect_attempts_total": 9,
+                    "reconnects_total": 2,
+                    "tunnel_uptime_seconds": 3600.0,
+                    "tunnel_downtime_seconds": 30.0,
+                    "recent_events": [{"at": 1.0, "type": "connected"}],
+                }
+            },
+        },
     )
-    with d._status_lock:
-        data = d._read_status_json()
-        for key in (
-            "connect_attempts_total", "sessions_total", "reconnects_total"
-        ):
-            data.setdefault(key, 0)
-        for key in ("tunnel_uptime_seconds", "tunnel_downtime_seconds"):
-            data.setdefault(key, 0.0)
-        data.setdefault("recent_events", [])
-        d._write_status_json(data)
+    d._store.begin(["default"], started_at=2.0)
 
-    merged = d._read_status_json()
+    merged = _section(d)
     assert merged["sessions_total"] == 7
     assert merged["connect_attempts_total"] == 9
     assert merged["reconnects_total"] == 2
     assert merged["tunnel_uptime_seconds"] == 3600.0
+    assert merged["tunnel_downtime_seconds"] == 30.0
     assert len(merged["recent_events"]) == 1
+    # 只有 started_at（进程运行时长）重置。
+    assert d._store.started_at() == 2.0
+
+
+def test_begin_migrates_and_primes_every_profile(tmp_path) -> None:
+    """begin() 把旧扁平文件迁成 default profile，并为新 profile 补零。"""
+    d = TunnelDaemon(_cfg(tmp_path))
+    _write_status_file(d, {"started_at": 1.0, "sessions_total": 7, "healthy": True})
+    d._store.begin(["default", "offsite"], started_at=2.0)
+    sections = d._store.read_profiles()
+    assert sections["default"]["sessions_total"] == 7
+    assert sections["default"]["healthy"] is True
+    assert sections["offsite"]["sessions_total"] == 0
+    assert sections["offsite"]["tunnel_uptime_seconds"] == 0.0
+    assert sections["offsite"]["recent_events"] == []
 
 
 def test_status_surfaces_statistics(tmp_path) -> None:
-    """status() 把统计字段从 JSON 透出到 DaemonStatus。"""
+    """status() 把统计字段从 JSON 透出到 ProfileStatus。"""
     cfg = _cfg(tmp_path)
     d = TunnelDaemon(cfg)
     _live_pid(tmp_path)
     now = time.time()
-    d._write_status_json(
+    _write_status_file(
+        d,
         {
             "started_at": now - 100,
-            "healthy": True,
-            "remote_ports": {"23334": True},
-            "connect_attempts_total": 5,
-            "sessions_total": 4,
-            "reconnects_total": 3,
-            "tunnel_uptime_seconds": 400.0,
-            "tunnel_downtime_seconds": 100.0,
-            "current_session_at": now - 50,
-            "last_disconnect_at": now - 60,
-            "last_disconnect_reason": "ssh exited with code 255",
-            "recent_events": [{"at": now, "type": "connecting"}],
-        }
+            "profiles": {
+                "default": {
+                    "healthy": True,
+                    "remote_ports": {"23334": True},
+                    "connect_attempts_total": 5,
+                    "sessions_total": 4,
+                    "reconnects_total": 3,
+                    "tunnel_uptime_seconds": 400.0,
+                    "tunnel_downtime_seconds": 100.0,
+                    "current_session_at": now - 50,
+                    "last_disconnect_at": now - 60,
+                    "last_disconnect_reason": "ssh exited with code 255",
+                    "recent_events": [{"at": now, "type": "connecting"}],
+                }
+            },
+        },
     )
     s = d.status()
-    assert s.connect_attempts_total == 5
-    assert s.sessions_total == 4
-    assert s.reconnects_total == 3
-    assert s.tunnel_uptime_seconds == 400.0
-    assert s.tunnel_downtime_seconds == 100.0
-    assert s.current_session_at is not None and s.current_session_at <= now
-    assert s.last_disconnect_reason == "ssh exited with code 255"
-    assert s.recent_events == [{"at": now, "type": "connecting"}]
+    profile = s.profiles[0]
+    assert profile.name == "default"
+    assert profile.connect_attempts_total == 5
+    assert profile.sessions_total == 4
+    assert profile.reconnects_total == 3
+    assert profile.tunnel_uptime_seconds == 400.0
+    assert profile.tunnel_downtime_seconds == 100.0
+    assert profile.current_session_at is not None
+    assert profile.current_session_at <= now
+    assert profile.last_disconnect_reason == "ssh exited with code 255"
+    assert profile.recent_events == [{"at": now, "type": "connecting"}]
     # 派生属性
-    assert s.session_uptime is not None
-    assert s.availability is not None
-    assert abs(s.availability - 0.8) < 1e-9  # 400 / (400 + 100)
+    assert profile.session_uptime is not None
+    assert profile.availability is not None
+    assert abs(profile.availability - 0.8) < 1e-9  # 400 / (400 + 100)
+    assert s.uptime_seconds >= 100.0
+
+
+# ---------------------------------------------------------------------------
+# 多 profile（一个守护进程监督多条 SSH 连接）
+# ---------------------------------------------------------------------------
+
+
+def _two_profile_cfg(tmp_path) -> TunnelConfig:
+    """A config with two profiles, each with its own endpoint and tunnel."""
+    cfg = _cfg(tmp_path)
+    source = cfg.profiles[0]
+    return dataclasses.replace(
+        cfg,
+        profiles=[
+            Profile(
+                name=name,
+                ssh=dataclasses.replace(source.ssh, host=f"{name}.example.com"),
+                tunnels=source.tunnels,
+            )
+            for name in ("web", "db")
+        ],
+    )
+
+
+class _ProfileManager(_DurationManager):
+    """Manager stand-in for ProfileRunner tests: no probes, known duration."""
+
+    def __init__(self, duration: float) -> None:
+        super().__init__([duration])
+        self.calls = 1  # one completed session → last_session_duration is set
+        self.stop_calls = 0
+
+    def is_running(self) -> bool:
+        return True
+
+    def check_remote_ports(self, timeout: int = 10) -> dict[int, bool]:
+        return {}
+
+    def check_local_ports(self, timeout: float = 1.0) -> dict[int, bool]:
+        return {}
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+
+
+class _ScriptedRetry:
+    """RetryRunner stand-in that yields a fixed event list and then ends."""
+
+    def __init__(self, events: list[RetryEvent]) -> None:
+        self.events = events
+        self.stop_calls = 0
+
+    def run(self, _manager):
+        yield from self.events
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+
+
+def test_profile_runner_records_events_for_its_own_profile(tmp_path) -> None:
+    """一个 profile 的运行时把事件折进自己的 section，并同步停止 SSH。"""
+    cfg = _cfg(tmp_path)
+    d = TunnelDaemon(cfg)
+    manager = _ProfileManager(42.0)
+    runner = ProfileRunner(
+        cfg.profiles[0],
+        cfg,
+        d,
+        manager=manager,
+        retry_runner=_ScriptedRetry(
+            [
+                RetryEvent.connecting(),
+                RetryEvent.connected(),
+                RetryEvent.disconnected(1, error="boom"),
+            ]
+        ),
+    )
+    runner.start()
+    runner.finish()
+
+    section = _section(d)
+    assert section["connect_attempts_total"] == 1
+    assert section["sessions_total"] == 1
+    assert section["tunnel_uptime_seconds"] == 42.0
+    assert section["last_disconnect_reason"] == "boom"
+    assert manager.stop_calls >= 1, "停止时必须收起 SSH 会话"
+    assert runner.error is None
+
+
+def test_profile_runner_records_crash(tmp_path) -> None:
+    """一个 profile 的循环崩掉 → 记入状态文件，而不是静默死掉。"""
+
+    class _BoomRetry:
+        def run(self, _manager):
+            raise RuntimeError("retry boom")
+            yield  # pragma: no cover - unreachable, keeps this a generator
+
+        def stop(self) -> None:
+            pass
+
+    cfg = _cfg(tmp_path)
+    d = TunnelDaemon(cfg)
+    runner = ProfileRunner(
+        cfg.profiles[0], cfg, d, manager=_ProfileManager(1.0), retry_runner=_BoomRetry()
+    )
+    runner.start()
+    runner.finish()
+
+    assert "retry boom" in (runner.error or "")
+    assert "retry boom" in (_section(d).get("error") or "")
+
+
+def test_run_supervises_every_profile(tmp_path, monkeypatch) -> None:
+    """run() 为每个 profile 起一个 runner，全部结束后退出并收尾。"""
+    import signal as signal_module
+
+    started: list[str] = []
+    aborted: list[str] = []
+
+    class _StubRunner:
+        def __init__(self, profile, config, daemon, **_kw) -> None:
+            self.profile = profile
+
+        def start(self) -> None:
+            started.append(self.profile.name)
+
+        def abort(self) -> None:
+            aborted.append(self.profile.name)
+
+        def finish(self) -> None:
+            pass
+
+        def is_alive(self) -> bool:
+            return False  # 立即结束，避免测试挂住
+
+    monkeypatch.setattr("ponte.daemon.ProfileRunner", _StubRunner)
+    monkeypatch.setattr(TunnelDaemon, "_setup_logging", lambda self: None)
+    monkeypatch.setattr(TunnelDaemon, "write_pid", lambda self: None)
+    monkeypatch.setattr(TunnelDaemon, "_cleanup", lambda self: None)
+    monkeypatch.setattr(TunnelDaemon, "_watch_stop_marker", lambda self, cb: None)
+    monkeypatch.setattr(signal_module, "signal", lambda *_a: None)
+
+    d = TunnelDaemon(_two_profile_cfg(tmp_path))
+    assert d.run() == 0
+    assert started == ["web", "db"]
+    assert aborted == ["web", "db"]
+    assert set(d._store.read_profiles()) == {"web", "db"}
+
+
+def test_status_lists_config_profiles_in_order(tmp_path) -> None:
+    """status() 按配置顺序列出每个 profile，未上报的显示未知。"""
+    d = TunnelDaemon(_two_profile_cfg(tmp_path))
+    _live_pid(tmp_path)
+    d._store.begin(["web"], started_at=time.time())
+    d._on_health(_unhealthy_status(), profile="web")
+
+    s = d.status()
+    assert [profile.name for profile in s.profiles] == ["web", "db"]
+    assert s.profiles[0].healthy is False
+    assert s.profiles[1].healthy is None
+    assert s.healthy is False
+
+
+def test_profile_names_follow_the_config(tmp_path) -> None:
+    assert TunnelDaemon(_two_profile_cfg(tmp_path)).profile_names == ["web", "db"]
+    assert TunnelDaemon(_cfg(tmp_path)).profile_names == ["default"]
 
 
 # ---------------------------------------------------------------------------

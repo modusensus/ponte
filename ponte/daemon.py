@@ -22,6 +22,7 @@ does not exit within a timeout the CLI escalates to ``taskkill /T /F``.
 from __future__ import annotations
 
 import base64
+import contextlib
 import dataclasses
 import json
 import logging
@@ -32,15 +33,15 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from xml.sax.saxutils import escape as xml_escape
 
-from ponte.config import TunnelConfig, get_config
+from ponte.config import DEFAULT_PROFILE_NAME, Profile, TunnelConfig, get_config
 from ponte.core import TunnelManager, creation_flags
 from ponte.health import HealthChecker, HealthStatus
 from ponte.retry import RetryEvent, RetryRunner
 
-__all__ = ["DaemonStatus", "TunnelDaemon"]
+__all__ = ["DaemonStatus", "ProfileRunner", "ProfileStatus", "TunnelDaemon"]
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,35 @@ _HEALTH_FAILURE_THRESHOLD = 3
 #: How many recent retry-loop events to keep in the status JSON event feed
 #: (rendered by ``ponte watch``, surfaced by ``ponte status``).
 _EVENT_FEED_LIMIT = 20
+
+#: Keys a profile section of the status file may hold. Only used to migrate a
+#: pre-``profiles`` status file, whose single-tunnel state sat at the top level.
+_PROFILE_KEYS = frozenset(
+    {
+        "process_alive",
+        "healthy",
+        "remote_ports",
+        "local_ports",
+        "health_error",
+        "checked_at",
+        "connect_attempts_total",
+        "sessions_total",
+        "reconnects_total",
+        "tunnel_uptime_seconds",
+        "tunnel_downtime_seconds",
+        "current_session_at",
+        "last_disconnect_at",
+        "last_disconnect_reason",
+        "recent_events",
+        "error",
+    }
+)
+
+#: Thread join timeout when shutting a profile down (seconds).
+_PROFILE_JOIN_TIMEOUT = 10.0
+
+#: Interval (seconds) the daemon's main thread sleeps between liveness sweeps.
+_SUPERVISOR_INTERVAL = 0.5
 
 
 def _derive_status_file(pid_file: str) -> str:
@@ -131,20 +161,25 @@ def _run_tool(
 
 
 @dataclasses.dataclass
-class DaemonStatus:
-    """A snapshot of daemon state for the ``status``/``stop`` commands."""
+class ProfileStatus:
+    """Health and cumulative statistics for one profile (one SSH connection).
 
-    running: bool
-    pid: int | None = None
-    started_at: float | None = None
-    uptime_seconds: float = 0.0
+    This is everything that used to be reported as "the tunnel": with several
+    profiles configured, each one gets its own snapshot so a broken server is
+    visible next to the healthy ones instead of being averaged away.
+    """
+
+    name: str
+    #: ``None`` until the first health check of this profile reports in.
     healthy: bool | None = None
+    process_alive: bool | None = None
     remote_ports: dict[int, bool] = dataclasses.field(default_factory=dict)
     """``-R`` ports open on the server, ``{port: listening}``."""
     local_ports: dict[int, bool] = dataclasses.field(default_factory=dict)
     """``-L``/``-D`` ports this machine listens on, ``{port: listening}``."""
     health_error: str | None = None
-    message: str = ""
+    #: Set when this profile's retry loop died of an unexpected exception.
+    error: str | None = None
 
     # -- 隧道统计（cumulative; survives daemon restarts via the status file）--
     #
@@ -170,11 +205,6 @@ class DaemonStatus:
     recent_events: list[dict] = dataclasses.field(default_factory=list)
 
     @property
-    def uptime(self) -> str:
-        """Human readable uptime, e.g. ``1h 2m 3s``."""
-        return _format_duration(self.uptime_seconds)
-
-    @property
     def session_uptime(self) -> str | None:
         """Human-readable duration of the current session, ``None`` when down.
 
@@ -188,7 +218,7 @@ class DaemonStatus:
 
     @property
     def availability(self) -> float | None:
-        """Fraction of observed time the tunnel has been up (0..1).
+        """Fraction of observed time this profile has been up (0..1).
 
         Based on the *completed* session/downtime bookkeeping; the ongoing
         session's elapsed time is not yet counted, so a freshly reconnected
@@ -203,12 +233,333 @@ class DaemonStatus:
         return up / total
 
 
-class TunnelDaemon:
-    """Run and manage the persistent SSH reverse-tunnel process.
+@dataclasses.dataclass
+class DaemonStatus:
+    """A snapshot of daemon state for the ``status``/``stop`` commands."""
 
-    The daemon is intentionally *stateless on disk*: everything it needs lives
-    in ``config.toml``, and the only mutable artifacts are the PID file, the
-    JSON status file (updated by the health loop) and the stop marker.
+    running: bool
+    pid: int | None = None
+    started_at: float | None = None
+    uptime_seconds: float = 0.0
+    #: One entry per configured profile, in configuration order.
+    profiles: list[ProfileStatus] = dataclasses.field(default_factory=list)
+    message: str = ""
+
+    @property
+    def uptime(self) -> str:
+        """Human readable uptime, e.g. ``1h 2m 3s``."""
+        return _format_duration(self.uptime_seconds)
+
+    @property
+    def healthy(self) -> bool | None:
+        """Overall health: ``True`` only when *every* profile is healthy.
+
+        ``None`` when no profile has reported yet. Useful for a single boolean
+        (the watch panel border) while ``profiles`` carries the detail.
+        """
+        if not self.profiles:
+            return None
+        marks = [profile.healthy for profile in self.profiles]
+        if all(mark is None for mark in marks):
+            return None
+        return all(mark is True for mark in marks)
+
+    def get_profile(self, name: str) -> ProfileStatus | None:
+        """Return the status of *name*, or ``None`` if it never reported."""
+        for profile in self.profiles:
+            if profile.name == name:
+                return profile
+        return None
+
+
+def _profile_status(name: str, section: dict) -> ProfileStatus:
+    """Build a :class:`ProfileStatus` from one status-file section.
+
+    Tolerant on purpose: the file is written by whichever daemon version is
+    installed, so missing or malformed fields degrade to ``None``/empty rather
+    than raising while the user is trying to read their status.
+    """
+
+    def _number(key: str) -> float | None:
+        value = section.get(key)
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _count(key: str) -> int | None:
+        value = _number(key)
+        return None if value is None else int(value)
+
+    def _ports(key: str) -> dict[int, bool]:
+        raw = section.get(key)
+        ports: dict[int, bool] = {}
+        if isinstance(raw, dict):
+            for port, is_open in raw.items():
+                try:
+                    ports[int(port)] = bool(is_open)
+                except (TypeError, ValueError):
+                    continue
+        return ports
+
+    raw_healthy = section.get("healthy")
+    raw_alive = section.get("process_alive")
+    return ProfileStatus(
+        name=name,
+        healthy=raw_healthy if isinstance(raw_healthy, bool) else None,
+        process_alive=raw_alive if isinstance(raw_alive, bool) else None,
+        remote_ports=_ports("remote_ports"),
+        local_ports=_ports("local_ports"),
+        health_error=section.get("health_error"),
+        error=section.get("error"),
+        connect_attempts_total=_count("connect_attempts_total"),
+        sessions_total=_count("sessions_total"),
+        reconnects_total=_count("reconnects_total"),
+        tunnel_uptime_seconds=_number("tunnel_uptime_seconds"),
+        tunnel_downtime_seconds=_number("tunnel_downtime_seconds"),
+        current_session_at=_number("current_session_at"),
+        last_disconnect_at=_number("last_disconnect_at"),
+        last_disconnect_reason=section.get("last_disconnect_reason"),
+        recent_events=[
+            dict(event)
+            for event in section.get("recent_events", [])
+            if isinstance(event, dict)
+        ],
+    )
+
+
+class _StatusStore:
+    """Locked read-modify-write access to the shared JSON status file.
+
+    The payload is ``{"started_at": <daemon start>, "profiles": {name: {...}}}``.
+    Every writer — each profile's retry loop and every health loop — goes through
+    this class, so two threads can never interleave a read and a write.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+
+    # -- low level ---------------------------------------------------------
+
+    def _read(self) -> dict:
+        try:
+            with open(self.path, encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _write(self, payload: dict) -> None:
+        try:
+            with open(self.path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            logger.warning("could not write status file: %s", exc)
+
+    @staticmethod
+    def _sections(data: dict) -> dict[str, dict]:
+        """Return the per-profile sections of *data*, migrating old payloads.
+
+        Pre-``profiles`` status files kept one tunnel's state at the top level;
+        those keys are adopted as the ``default`` profile so an in-place
+        upgrade keeps its counters instead of silently starting over.
+        """
+        sections = data.get("profiles")
+        if isinstance(sections, dict):
+            return {
+                str(name): dict(section)
+                for name, section in sections.items()
+                if isinstance(section, dict)
+            }
+        legacy = {key: value for key, value in data.items() if key in _PROFILE_KEYS}
+        return {DEFAULT_PROFILE_NAME: legacy} if legacy else {}
+
+    # -- public ------------------------------------------------------------
+
+    def read_profiles(self) -> dict[str, dict]:
+        """Return every profile section, migrating a legacy payload on the fly."""
+        with self._lock:
+            return self._sections(self._read())
+
+    def started_at(self) -> float | None:
+        """Wall-clock time the current daemon process started."""
+        with self._lock:
+            value = self._read().get("started_at")
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def begin(self, names: list[str], started_at: float) -> None:
+        """Prime the file: one section per profile, counters defaulted to 0.
+
+        Merges rather than overwrites, so the cumulative statistics of a tunnel
+        survive a service-manager respawn (which is exactly when the user cares
+        about the history).
+        """
+        with self._lock:
+            sections = self._sections(self._read())
+            for name in names:
+                section = sections.setdefault(name, {})
+                for key in (
+                    "connect_attempts_total",
+                    "sessions_total",
+                    "reconnects_total",
+                ):
+                    section.setdefault(key, 0)
+                for key in ("tunnel_uptime_seconds", "tunnel_downtime_seconds"):
+                    section.setdefault(key, 0.0)
+                section.setdefault("recent_events", [])
+            self._write({"started_at": started_at, "profiles": sections})
+
+    @contextlib.contextmanager
+    def edit(self, name: str) -> Iterator[dict]:
+        """Yield one profile's section for mutation, then persist the file.
+
+        The lock is held for the whole read-modify-write, so the body must stay
+        short and must not block (no process teardown inside the ``with``).
+        """
+        with self._lock:
+            data = self._read()
+            sections = self._sections(data)
+            section = sections.setdefault(name, {})
+            started_at = data.get("started_at", time.time())
+            yield section
+            self._write({"started_at": started_at, "profiles": sections})
+
+
+class ProfileRunner:
+    """Keep one profile's SSH connection alive.
+
+    Owns that profile's session manager, reconnect loop and health monitor, and
+    reports every event to the daemon's status file. The daemon builds one per
+    configured profile and runs them concurrently, so a profile that cannot
+    reach its server backs off on its own without disturbing the others.
+
+    ``manager`` and ``retry_runner`` can be injected for tests; production goes
+    through :meth:`TunnelDaemon.run`.
+    """
+
+    def __init__(
+        self,
+        profile: Profile,
+        config: TunnelConfig,
+        daemon: TunnelDaemon,
+        *,
+        manager: TunnelManager | None = None,
+        retry_runner: RetryRunner | None = None,
+    ) -> None:
+        self.profile = profile
+        self.config = config
+        self.daemon = daemon
+        self.manager = manager if manager is not None else TunnelManager(config, profile)
+        self.retry = (
+            retry_runner if retry_runner is not None else RetryRunner(config.retry)
+        )
+        self.health = HealthChecker(self.manager, config.health)
+        self.health_stop: threading.Event | None = None
+        self.thread: threading.Thread | None = None
+        #: Message of an unexpected exception that killed this profile's loop.
+        self.error: str | None = None
+
+    # -- Lifecycle ---------------------------------------------------------
+
+    def start(self) -> None:
+        """Start the health monitor and the reconnect loop on their own threads."""
+        self.health_stop = self.health.run_loop(
+            interval=self.config.health.check_interval,
+            callback=self._on_health,
+            name=f"ponte-health-{self.profile.name}",
+        )
+        self.thread = threading.Thread(
+            target=self._run, name=f"ponte-{self.profile.name}", daemon=True
+        )
+        self.thread.start()
+
+    def abort(self) -> None:
+        """Ask the loops and the SSH session to stop. Safe from any thread.
+
+        Deliberately does not join: it runs in the signal handler and the
+        stop-marker watcher, where blocking would freeze the shutdown path.
+        """
+        if self.health_stop is not None:
+            self.health_stop.set()
+        self.retry.stop()  # abort any backoff sleep
+        self.manager.stop()  # abort a blocked connect(), if any
+
+    def finish(self) -> None:
+        """:meth:`abort` plus wait for this profile's loop thread to end."""
+        self.abort()
+        if self.thread is not None and self.thread is not threading.current_thread():
+            self.thread.join(timeout=_PROFILE_JOIN_TIMEOUT)
+
+    def is_alive(self) -> bool:
+        """``True`` while this profile's reconnect loop is still running."""
+        return self.thread is not None and self.thread.is_alive()
+
+    # -- Internals ---------------------------------------------------------
+
+    def _run(self) -> None:
+        """Drain this profile's retry generator until stopped."""
+        log = logging.getLogger("ponte.daemon")
+        name = self.profile.name
+        try:
+            for event in self.retry.run(self.manager):
+                self.daemon._record_retry_event(event, self.manager, name)
+                if event.type == RetryEvent.CONNECTING:
+                    log.debug("[%s] connecting to %s …", name, self.profile.destination)
+                elif event.type == RetryEvent.CONNECTED:
+                    # Only means "an SSH session started": whether it stays up
+                    # is known after it exits (DISCONNECTED carries the code).
+                    log.info("[%s] SSH session started", name)
+                elif event.type == RetryEvent.DISCONNECTED:
+                    log.warning(
+                        "[%s] tunnel down (exit=%s error=%s)",
+                        name,
+                        event.exit_code,
+                        event.error,
+                    )
+                elif event.type == RetryEvent.RETRYING:
+                    log.warning(
+                        "[%s] reconnecting attempt %d in %.1fs",
+                        name,
+                        event.attempt,
+                        event.delay,
+                    )
+                elif event.type == RetryEvent.MAX_RETRIES_REACHED:
+                    log.error("[%s] retry budget exhausted; giving up", name)
+                if self.daemon._shutdown.is_set():
+                    self.manager.stop()
+        except Exception as exc:  # noqa: BLE001 - one profile must not kill the rest
+            self.error = f"{type(exc).__name__}: {exc}"
+            log.exception("[%s] retry loop died", name)
+            self.daemon._record_profile_error(name, self.error)
+        finally:
+            self.retry.stop()
+            self.manager.stop()
+
+    def _on_health(self, status: HealthStatus) -> None:
+        """Persist this profile's health and force-reconnect a zombie session."""
+        self.daemon._on_health(status, self.manager, self.profile.name)
+
+
+class TunnelDaemon:
+    """Run and manage one persistent SSH connection per configured profile.
+
+    A single daemon supervises every profile: each gets a
+    :class:`ProfileRunner` (its own SSH session, reconnect loop and health
+    monitor) while this class owns the process-level concerns — PID file, stop
+    marker, JSON status file and service registration. One profile failing to
+    reach its server therefore leaves the others alone.
+
+    The daemon is intentionally *stateless on disk* beyond that: everything it
+    needs lives in ``config.toml``, and the only mutable artifacts are the PID
+    file, the status file and the stop marker.
     """
 
     def __init__(self, config: TunnelConfig | None = None) -> None:
@@ -217,18 +568,19 @@ class TunnelDaemon:
         self.log_file = self.config.daemon.log_file
         self.status_file = _derive_status_file(self.pid_file)
         self.stop_marker = _derive_stop_marker(self.pid_file)
+        self._store = _StatusStore(self.status_file)
         self._shutdown = threading.Event()
-        self._last_health: HealthStatus | None = None
-        # Guards the status file's read-modify-write cycles: the health thread
-        # and the retry-event (main) thread both update the same JSON.
-        self._status_lock = threading.Lock()
-        # Wall-clock time of the most recent DISCONNECTED whose downtime has
-        # not yet been closed by a new connection attempt (in-memory only).
-        self._pending_disconnect_at: float | None = None
-        # Consecutive unhealthy health checks observed by ``_on_health``. Used
-        # to detect a "zombie" SSH process and force a reconnect (see
+        # Per-profile in-memory bookkeeping, keyed by profile name.
+        self._last_health: dict[str, HealthStatus] = {}
+        # Wall-clock time of the most recent DISCONNECTED of a profile whose
+        # downtime has not yet been closed by a new connection attempt.
+        self._pending_disconnect_at: dict[str, float | None] = {}
+        # Consecutive unhealthy health checks per profile, used to detect a
+        # "zombie" SSH process and force a reconnect (see
         # ``_HEALTH_FAILURE_THRESHOLD``).
-        self._health_failures = 0
+        self._health_failures: dict[str, int] = {}
+        # Populated by run(); exposed for diagnostics and tests.
+        self._runners: list[ProfileRunner] = []
 
     # -- Paths -----------------------------------------------------------------
 
@@ -291,47 +643,38 @@ class TunnelDaemon:
 
     # -- Status JSON -----------------------------------------------------------
 
-    def _read_status_json(self) -> dict:
-        try:
-            with open(self.status_file, encoding="utf-8") as handle:
-                data = json.load(handle)
-                return data if isinstance(data, dict) else {}
-        except (OSError, ValueError):
-            return {}
-
-    def _write_status_json(self, payload: dict) -> None:
-        try:
-            with open(self.status_file, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, ensure_ascii=False, indent=2)
-        except OSError as exc:
-            logger.warning("could not write status file: %s", exc)
+    @property
+    def profile_names(self) -> list[str]:
+        """Names of the configured profiles, in configuration order."""
+        return self.config.profile_names
 
     # -- Health callback -------------------------------------------------------
 
     def _on_health(
-        self, status: HealthStatus, manager: TunnelManager | None = None
+        self,
+        status: HealthStatus,
+        manager: TunnelManager | None = None,
+        profile: str = DEFAULT_PROFILE_NAME,
     ) -> None:
-        """Store the latest health snapshot and mirror it to the JSON file.
+        """Store *profile*'s latest health snapshot and mirror it to the file.
 
-        Also tracks *consecutive* unhealthy checks. When the SSH process is
-        still alive but health has failed for ``_HEALTH_FAILURE_THRESHOLD``
-        checks in a row, the process is presumed to be a "zombie" (alive, yet
-        its remote forwarding ports have all dropped — e.g. after a network
-        hang or a port-stealing race). In that case ``manager.stop()`` is
-        called to kill the current SSH session, which makes the retry loop's
-        blocking ``connect()`` return so the tunnel is re-established instead
-        of being left down forever.
+        Also tracks *consecutive* unhealthy checks for that profile. When its
+        SSH process is still alive but health has failed for
+        ``_HEALTH_FAILURE_THRESHOLD`` checks in a row, the process is presumed
+        to be a "zombie" (alive, yet its forwarding ports have all dropped —
+        e.g. after a network hang or a port-stealing race). In that case
+        ``manager.stop()`` is called to kill the session, which makes the retry
+        loop's blocking ``connect()`` return so the tunnel is re-established
+        instead of being left down forever.
 
         ``manager`` may be ``None`` (e.g. in unit tests, or before ``run()``),
         in which case the forced-reconnect path is skipped — the health data is
         still persisted and logged as usual.
         """
-        self._last_health = status
-        with self._status_lock:
-            data = self._read_status_json()
-            data.update(
+        self._last_health[profile] = status
+        with self._store.edit(profile) as section:
+            section.update(
                 {
-                    "started_at": data.get("started_at", time.time()),
                     "checked_at": time.time(),
                     "process_alive": status.process_alive,
                     "healthy": status.all_healthy,
@@ -344,38 +687,44 @@ class TunnelDaemon:
                     "health_error": status.error,
                 }
             )
-            self._write_status_json(data)
         health = logger.warning if not status.all_healthy else logger.debug
-        health("health: %s", status)
+        health("health[%s]: %s", profile, status)
 
         # Healthy check: reset the consecutive-failure counter.
         if status.all_healthy:
-            self._health_failures = 0
+            self._health_failures[profile] = 0
             return
 
         # Unhealthy check: count it, and if the SSH process is still alive
         # (i.e. a zombie rather than a cleanly-exited process) force reconnect.
-        self._health_failures += 1
+        failures = self._health_failures.get(profile, 0) + 1
+        self._health_failures[profile] = failures
         if (
-            self._health_failures >= _HEALTH_FAILURE_THRESHOLD
+            failures >= _HEALTH_FAILURE_THRESHOLD
             and status.process_alive
             and manager is not None
         ):
             logger.warning(
-                "假死，强制重连: %d consecutive unhealthy checks while the "
+                "假死，强制重连 [%s]: %d consecutive unhealthy checks while the "
                 "SSH process is still alive; stopping session so the retry "
                 "loop reconnects",
-                self._health_failures,
+                profile,
+                failures,
             )
             manager.stop()
             # Reset so a persistent zombie re-triggers only after another full
             # run of consecutive failures (avoids repeating every check).
-            self._health_failures = 0
+            self._health_failures[profile] = 0
 
     # -- Retry-loop statistics -------------------------------------------------
 
-    def _record_retry_event(self, event: RetryEvent, manager: TunnelManager) -> None:
-        """Fold a retry-loop event into the cumulative tunnel statistics.
+    def _record_retry_event(
+        self,
+        event: RetryEvent,
+        manager: TunnelManager,
+        profile: str = DEFAULT_PROFILE_NAME,
+    ) -> None:
+        """Fold a retry-loop event into *profile*'s cumulative statistics.
 
         Event semantics (see :mod:`ponte.retry`): ``CONNECTING`` fires *before*
         the blocking ``connect()`` (session start), while ``CONNECTED`` and
@@ -383,8 +732,9 @@ class TunnelDaemon:
         session duration is taken from ``manager.last_session_duration``
         rather than from wall-clock deltas between events.
 
-        The counters are merged into the status JSON (read-modify-write under
-        the status lock) so they survive daemon restarts.
+        The counters are merged into the profile's section of the status JSON
+        (read-modify-write under the store's lock) so they survive daemon
+        restarts.
         """
         now = time.time()
         reason: str | None = None
@@ -396,30 +746,28 @@ class TunnelDaemon:
             else:
                 reason = "unknown"
 
-        with self._status_lock:
-            data = self._read_status_json()
-            data["started_at"] = data.get("started_at", now)
-            attempts = int(data.get("connect_attempts_total", 0))
-            sessions = int(data.get("sessions_total", 0))
-            reconnects = int(data.get("reconnects_total", 0))
-            uptime_total = float(data.get("tunnel_uptime_seconds", 0.0))
-            downtime_total = float(data.get("tunnel_downtime_seconds", 0.0))
-            feed = list(data.get("recent_events", []))
+        with self._store.edit(profile) as section:
+            attempts = int(section.get("connect_attempts_total", 0))
+            sessions = int(section.get("sessions_total", 0))
+            reconnects = int(section.get("reconnects_total", 0))
+            uptime_total = float(section.get("tunnel_uptime_seconds", 0.0))
+            downtime_total = float(section.get("tunnel_downtime_seconds", 0.0))
+            feed = list(section.get("recent_events", []))
 
             if event.type == RetryEvent.CONNECTING:
                 attempts += 1
                 # Close the previous downtime gap (disconnect → this attempt).
-                pending = self._pending_disconnect_at
+                pending = self._pending_disconnect_at.get(profile)
                 if pending is not None:
                     downtime_total += max(0.0, now - pending)
-                    self._pending_disconnect_at = None
+                    self._pending_disconnect_at[profile] = None
             elif event.type == RetryEvent.CONNECTED:
                 sessions += 1
             elif event.type == RetryEvent.DISCONNECTED:
                 duration = getattr(manager, "last_session_duration", None)
                 if duration is not None:
                     uptime_total += max(0.0, float(duration))
-                self._pending_disconnect_at = now
+                self._pending_disconnect_at[profile] = now
             elif event.type == RetryEvent.RETRYING:
                 reconnects += 1
 
@@ -437,7 +785,7 @@ class TunnelDaemon:
             feed.append(entry)
             del feed[:-_EVENT_FEED_LIMIT]
 
-            data.update(
+            section.update(
                 {
                     "connect_attempts_total": attempts,
                     "sessions_total": sessions,
@@ -449,54 +797,53 @@ class TunnelDaemon:
                     else (
                         None
                         if event.type == RetryEvent.DISCONNECTED
-                        else data.get("current_session_at")
+                        else section.get("current_session_at")
                     ),
                     "last_disconnect_at": now
                     if event.type == RetryEvent.DISCONNECTED
-                    else data.get("last_disconnect_at"),
+                    else section.get("last_disconnect_at"),
                     "last_disconnect_reason": reason
                     if event.type == RetryEvent.DISCONNECTED
-                    else data.get("last_disconnect_reason"),
+                    else section.get("last_disconnect_reason"),
                     "recent_events": feed,
                 }
             )
-            self._write_status_json(data)
 
     # -- Foreground loop -------------------------------------------------------
 
     def run(self) -> int:
-        """Block, keeping the tunnel up, until a stop is requested.
+        """Block, keeping every configured tunnel up, until stopped.
 
-        Runs the retry generator and the health-monitor loop together. Returns
-        the daemon exit code (``0`` for a clean, requested stop).
+        Each profile runs its own retry + health loops on their own threads;
+        this thread only supervises, and exits once every profile loop has
+        ended (retry budget exhausted, or a crash that
+        :class:`ProfileRunner` recorded). Returns the daemon exit code (``0``
+        for a clean, requested stop).
         """
         self._setup_logging()
         log = logging.getLogger("ponte.daemon")
 
         import ponte
         log.info(
-            "ponte v%s daemon starting (pid %d)", ponte.__version__, os.getpid()
+            "ponte v%s daemon starting (pid %d, profiles: %s)",
+            ponte.__version__,
+            os.getpid(),
+            ", ".join(self.profile_names) or "none",
         )
         self.write_pid()
         self._safe_remove(self.stop_marker)
 
-        manager = TunnelManager(self.config)
-        runner = RetryRunner(self.config.retry)
-        health = HealthChecker(manager, self.config.health)
-
         # Prime the status file with a start time before the first health tick.
-        # Merge, don't overwrite: the cumulative tunnel statistics below must
-        # survive daemon restarts (systemd / the Scheduled Task respawn the
-        # process on crash, and the user cares about the tunnel's history).
-        with self._status_lock:
-            data = self._read_status_json()
-            data["started_at"] = time.time()
-            for key in ("connect_attempts_total", "sessions_total", "reconnects_total"):
-                data.setdefault(key, 0)
-            for key in ("tunnel_uptime_seconds", "tunnel_downtime_seconds"):
-                data.setdefault(key, 0.0)
-            data.setdefault("recent_events", [])
-            self._write_status_json(data)
+        # Merge, don't overwrite: the cumulative tunnel statistics must survive
+        # daemon restarts (systemd / the Scheduled Task respawn the process on
+        # crash, and the user cares about the tunnel's history).
+        self._store.begin(self.profile_names, time.time())
+
+        self._runners = [
+            ProfileRunner(profile, self.config, self)
+            for profile in self.config.profiles
+        ]
+        runners = self._runners
 
         def request_stop(reason: str) -> None:
             """Request shutdown from any thread. Idempotent, never raises."""
@@ -504,8 +851,8 @@ class TunnelDaemon:
                 return
             log.info("shutdown requested: %s", reason)
             self._shutdown.set()
-            runner.stop()   # abort any backoff sleep
-            manager.stop()  # abort a blocked connect(), if any
+            for runner in runners:
+                runner.abort()
 
         # SIGINT (Ctrl+C) and, where catchable, SIGTERM.
         try:
@@ -522,45 +869,33 @@ class TunnelDaemon:
             name="ponte-stop-watch",
         ).start()
 
-        # Health checks run once immediately, then every check_interval.
-        health_stop = health.run_loop(
-            interval=self.config.health.check_interval,
-            callback=lambda st: self._on_health(st, manager),
-        )
-
         log.info(
-            "starting SSH retry loop (max_retries=%s)",
+            "starting SSH retry loop(s) (max_retries=%s, %d profile(s))",
             self.config.retry.max_retries,
+            len(runners),
         )
         try:
-            for event in runner.run(manager):
-                self._record_retry_event(event, manager)
-                if event.type == RetryEvent.CONNECTING:
-                    log.debug("connecting to %s ...", self.config.ssh.destination)
-                elif event.type == RetryEvent.CONNECTED:
-                    # Only means "an SSH session started": whether it stays up
-                    # is known after it exits (DISCONNECTED carries the code).
-                    log.info("SSH session started")
-                elif event.type == RetryEvent.DISCONNECTED:
-                    log.warning(
-                        "tunnel down (exit=%s error=%s)", event.exit_code, event.error
-                    )
-                elif event.type == RetryEvent.RETRYING:
-                    log.warning(
-                        "reconnecting attempt %d in %.1fs", event.attempt, event.delay
-                    )
-                elif event.type == RetryEvent.MAX_RETRIES_REACHED:
-                    log.error("retry budget exhausted; giving up")
-                if self._shutdown.is_set():
-                    manager.stop()
+            for runner in runners:
+                runner.start()
+            while not self._shutdown.is_set():
+                self._shutdown.wait(_SUPERVISOR_INTERVAL)
+                if not any(runner.is_alive() for runner in runners):
+                    log.warning("every profile loop has exited")
+                    break
+        except KeyboardInterrupt:  # pragma: no cover - must reload to trigger
+            request_stop("KeyboardInterrupt")
         finally:
-            health_stop.set()
-            runner.stop()
-            manager.stop()
-            self._shutdown.set()
+            request_stop("daemon shutdown")
+            for runner in runners:
+                runner.finish()
             self._cleanup()
         log.info("daemon exited cleanly")
         return 0
+
+    def _record_profile_error(self, profile: str, message: str) -> None:
+        """Record that a profile's loop died, so ``status`` can surface it."""
+        with self._store.edit(profile) as section:
+            section["error"] = message
 
     def _watch_stop_marker(self, request_stop: Callable[[str], None]) -> None:
         """Watch for a stop marker file and request a graceful shutdown."""
@@ -721,64 +1056,48 @@ class TunnelDaemon:
     # -- Status ----------------------------------------------------------------
 
     def status(self) -> DaemonStatus:
+        """Build a snapshot with one :class:`ProfileStatus` per profile."""
         pid = self.read_pid()
         if pid is None or not self._pid_alive(pid):
             return DaemonStatus(running=False, message="daemon is not running")
-        info = self._read_status_json()
-        started = info.get("started_at")
-        uptime = (time.time() - float(started)) if started else 0.0
-        current_session_at = info.get("current_session_at")
-        last_disconnect_at = info.get("last_disconnect_at")
-        attempts_raw = info.get("connect_attempts_total")
-        sessions_raw = info.get("sessions_total")
-        reconnects_raw = info.get("reconnects_total")
-        uptime_raw = info.get("tunnel_uptime_seconds")
-        downtime_raw = info.get("tunnel_downtime_seconds")
+        sections = self._store.read_profiles()
+        started = self._store.started_at()
+        uptime = (time.time() - started) if started else 0.0
+        # Configuration order first, then anything else the status file knows
+        # about — a profile dropped from the config keeps showing up until the
+        # daemon that still supervises it is stopped.
+        names = list(self.profile_names)
+        names += [name for name in sections if name not in names]
         return DaemonStatus(
             running=True,
             pid=pid,
-            started_at=float(started) if started else None,
+            started_at=started,
             uptime_seconds=max(0.0, uptime),
-            healthy=info.get("healthy"),
-            remote_ports={
-                int(p): bool(ok) for p, ok in dict(info.get("remote_ports", {})).items()
-            },
-            local_ports={
-                int(p): bool(ok) for p, ok in dict(info.get("local_ports", {})).items()
-            },
-            health_error=info.get("health_error"),
-            connect_attempts_total=int(attempts_raw) if attempts_raw is not None else None,
-            sessions_total=int(sessions_raw) if sessions_raw is not None else None,
-            reconnects_total=int(reconnects_raw) if reconnects_raw is not None else None,
-            tunnel_uptime_seconds=float(uptime_raw) if uptime_raw is not None else None,
-            tunnel_downtime_seconds=(
-                float(downtime_raw) if downtime_raw is not None else None
-            ),
-            current_session_at=(
-                float(current_session_at) if current_session_at is not None else None
-            ),
-            last_disconnect_at=(
-                float(last_disconnect_at) if last_disconnect_at is not None else None
-            ),
-            last_disconnect_reason=info.get("last_disconnect_reason"),
-            recent_events=[
-                dict(e) for e in info.get("recent_events", []) if isinstance(e, dict)
+            profiles=[
+                _profile_status(name, sections.get(name, {})) for name in names
             ],
         )
 
     # -- Diagnostics -----------------------------------------------------------
 
-    def test_connection(self, timeout: int = 10) -> bool:
-        """Run a one-off ``ssh ... echo OK`` against the configured endpoint."""
-        return TunnelManager(self.config).test_connection(timeout=timeout)
+    def test_connection(self, timeout: int = 10, profile: str | None = None) -> bool:
+        """Run a one-off ``ssh ... echo OK`` against one profile's endpoint."""
+        manager = TunnelManager(self.config, self.config.get_profile(profile))
+        return manager.test_connection(timeout=timeout)
 
-    def check_remote_ports(self, timeout: int = 10) -> dict[int, bool]:
-        """Probe which configured remote (``-R``) ports are currently listening."""
-        return TunnelManager(self.config).check_remote_ports(timeout=timeout)
+    def check_remote_ports(
+        self, timeout: int = 10, profile: str | None = None
+    ) -> dict[int, bool]:
+        """Probe one profile's remote (``-R``) ports on the server."""
+        manager = TunnelManager(self.config, self.config.get_profile(profile))
+        return manager.check_remote_ports(timeout=timeout)
 
-    def check_local_ports(self, timeout: float = 1.0) -> dict[int, bool]:
-        """Probe which configured local (``-L``/``-D``) ports are listening."""
-        return TunnelManager(self.config).check_local_ports(timeout=timeout)
+    def check_local_ports(
+        self, timeout: float = 1.0, profile: str | None = None
+    ) -> dict[int, bool]:
+        """Probe one profile's local (``-L``/``-D``) listeners."""
+        manager = TunnelManager(self.config, self.config.get_profile(profile))
+        return manager.check_local_ports(timeout=timeout)
 
     # -- Cross-platform service install ----------------------------------------
 

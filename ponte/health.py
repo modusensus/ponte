@@ -211,7 +211,10 @@ class HealthChecker:
     # -- Background loop ------------------------------------------------------
 
     def run_loop(
-        self, interval: float | None = None, callback: HealthCallback | None = None
+        self,
+        interval: float | None = None,
+        callback: HealthCallback | None = None,
+        name: str = "ponte-health-check",
     ) -> threading.Event:
         """Run checks every ``interval`` seconds in a background daemon thread.
 
@@ -220,6 +223,9 @@ class HealthChecker:
             callback: Called with each :class:`HealthStatus`. A raising callback
                 is caught and recorded in ``last_callback_error`` so it cannot
                 kill the monitor thread.
+            name: Thread name. The daemon makes it per-profile
+                (``ponte-health-<profile>``) so one monitor per tunnel stays
+                identifiable in a thread dump.
 
         Returns:
             A :class:`threading.Event` that, when set, stops the loop. The loop
@@ -283,9 +289,7 @@ class HealthChecker:
                 except Exception as exc:  # noqa: BLE001
                     self.last_callback_error = exc
 
-        thread = threading.Thread(
-            target=_loop, name="ponte-health-check", daemon=True
-        )
+        thread = threading.Thread(target=_loop, name=name, daemon=True)
         thread.start()
         return stop_event
 

@@ -212,7 +212,7 @@ def status(
         help="以 JSON 输出（供脚本 / 监控系统消费）",
     ),
 ) -> None:
-    """查看守护进程与隧道健康状态。"""
+    """查看守护进程与各隧道健康状态（每条隧道一行）。"""
     try:
         s = _daemon().status()
         if not s.running:
@@ -223,86 +223,133 @@ def status(
             raise typer.Exit(code=0)
 
         if json_output:
-            console.print_json(
-                json.dumps(
-                    {
-                        "running": True,
-                        "pid": s.pid,
-                        "started_at": s.started_at,
-                        "uptime_seconds": round(s.uptime_seconds, 1),
-                        "healthy": s.healthy,
-                        "health_error": s.health_error,
-                        "remote_ports": {
-                            str(p): ok for p, ok in s.remote_ports.items()
-                        },
-                        "local_ports": {
-                            str(p): ok for p, ok in s.local_ports.items()
-                        },
-                        "connect_attempts_total": s.connect_attempts_total,
-                        "sessions_total": s.sessions_total,
-                        "reconnects_total": s.reconnects_total,
-                        "tunnel_uptime_seconds": (
-                            round(s.tunnel_uptime_seconds, 1)
-                            if s.tunnel_uptime_seconds is not None
-                            else None
-                        ),
-                        "tunnel_downtime_seconds": (
-                            round(s.tunnel_downtime_seconds, 1)
-                            if s.tunnel_downtime_seconds is not None
-                            else None
-                        ),
-                        "current_session_at": s.current_session_at,
-                        "last_disconnect_at": s.last_disconnect_at,
-                        "last_disconnect_reason": s.last_disconnect_reason,
-                        "recent_events": s.recent_events,
-                    },
-                    ensure_ascii=False,
-                )
-            )
+            console.print_json(json.dumps(_status_payload(s), ensure_ascii=False))
             return
 
-        table = Table(title="ponte 状态", header_style="bold cyan")
-        table.add_column("项目", no_wrap=True, style="cyan")
-        table.add_column("值")
+        # 单隧道配置保持原有的一表格布局；多隧道时守护进程信息单独一张表，
+        # 每条隧道各一张，避免把两条连接的状态挤进一列。
+        if len(s.profiles) <= 1:
+            table = _status_table("ponte 状态")
+            _add_daemon_rows(table, s)
+            if s.profiles:
+                _add_profile_rows(table, s.profiles[0])
+            if s.message:
+                table.add_row("备注", escape(s.message))
+            console.print(table)
+            return
 
-        table.add_row("PID", str(s.pid) if s.pid is not None else "—")
-        table.add_row("运行时长", s.uptime)
-
-        if s.healthy is True:
-            health_markup = "[green]健康[/green]"
-        elif s.healthy is None:
-            health_markup = "[yellow]未知[/yellow]"
-        else:
-            detail = escape(s.health_error or "")
-            health_markup = "[red]异常[/red]" + (f"（{detail}）" if detail else "")
-        table.add_row("健康状态", health_markup)
-
-        for port, ok in sorted(s.remote_ports.items()):
-            mark = "[green]监听中[/green]" if ok else "[red]未监听[/red]"
-            table.add_row(f"远程端口 {port}", mark)
-        for port, ok in sorted(s.local_ports.items()):
-            mark = "[green]监听中[/green]" if ok else "[red]未监听[/red]"
-            table.add_row(f"本地端口 {port}", mark)
-
-        # 隧道统计：区分“守护进程活了多久”和“隧道活了多久”，暴露反复断线。
-        if s.current_session_at is not None:
-            session_uptime = _format_duration(time.time() - s.current_session_at)
-            table.add_row("当前会话时长", session_uptime)
-        if s.sessions_total is not None:
-            stats = (
-                f"会话 {s.sessions_total} 次 · 重连 {s.reconnects_total} 次"
-            )
-            if s.last_disconnect_reason:
-                stats += f" · 上次断线：{s.last_disconnect_reason}"
-            table.add_row("隧道统计", escape(stats))
-        if s.message:
-            table.add_row("备注", escape(s.message))
-
-        console.print(table)
+        header = _status_table("ponte 守护进程")
+        _add_daemon_rows(header, s)
+        header.add_row("隧道数", str(len(s.profiles)))
+        console.print(header)
+        for profile in s.profiles:
+            table = _status_table(f"隧道 {profile.name}")
+            _add_profile_rows(table, profile)
+            console.print(table)
     except typer.Exit:
         raise
     except Exception as exc:
         _fail(str(exc))
+
+
+def _status_table(title: str) -> Table:
+    """A two-column key/value table used by ``status``."""
+    table = Table(title=title, header_style="bold cyan")
+    table.add_column("项目", no_wrap=True, style="cyan")
+    table.add_column("值")
+    return table
+
+
+def _markup_health(healthy: bool | None, error: str | None) -> str:
+    """Render a health flag, with the probe error when there is one."""
+    if healthy is True:
+        return "[green]健康[/green]"
+    if healthy is None:
+        return "[yellow]未知[/yellow]"
+    detail = escape(error or "")
+    return "[red]异常[/red]" + (f"（{detail}）" if detail else "")
+
+
+def _markup_port(ok: bool) -> str:
+    return "[green]监听中[/green]" if ok else "[red]未监听[/red]"
+
+
+def _add_daemon_rows(table: Table, s) -> None:  # noqa: ANN001 - DaemonStatus cycle guard
+    """Append process-level rows (shared by every profile)."""
+    table.add_row("PID", str(s.pid) if s.pid is not None else "—")
+    table.add_row("运行时长", s.uptime)
+
+
+def _add_profile_rows(table: Table, profile) -> None:  # noqa: ANN001 - cycle guard
+    """Append one profile's health, statistics and port states to *table*."""
+    table.add_row("健康状态", _markup_health(profile.healthy, profile.health_error))
+
+    # 会话时长是区分“守护进程活了多久”与“隧道活了多久”的那一列。
+    if profile.current_session_at is not None:
+        table.add_row(
+            "当前会话时长",
+            _format_duration(time.time() - profile.current_session_at),
+        )
+
+    if profile.sessions_total is not None:
+        availability = profile.availability
+        stats = f"会话 {profile.sessions_total} 次 · 重连 {profile.reconnects_total} 次"
+        if profile.tunnel_uptime_seconds is not None:
+            stats += " · 在线率 " + (
+                "—" if availability is None else f"{availability * 100:.1f}%"
+            )
+        if profile.last_disconnect_reason:
+            stats += f" · 上次断线：{profile.last_disconnect_reason}"
+        table.add_row("隧道统计", escape(stats))
+
+    for port, ok in sorted(profile.remote_ports.items()):
+        table.add_row(f"远程端口 {port}", _markup_port(ok))
+    for port, ok in sorted(profile.local_ports.items()):
+        table.add_row(f"本地端口 {port}", _markup_port(ok))
+
+    if profile.error:
+        table.add_row("错误", f"[red]{escape(profile.error)}[/red]")
+
+
+def _round1(value: float | None) -> float | None:
+    """Round a stat for JSON output, passing ``None`` through."""
+    return None if value is None else round(value, 1)
+
+
+def _profile_payload(profile) -> dict:  # noqa: ANN001 - ProfileStatus cycle guard
+    """Machine-readable snapshot of one profile (the ``--json`` contract)."""
+    return {
+        "healthy": profile.healthy,
+        "process_alive": profile.process_alive,
+        "health_error": profile.health_error,
+        "error": profile.error,
+        "remote_ports": {str(p): ok for p, ok in profile.remote_ports.items()},
+        "local_ports": {str(p): ok for p, ok in profile.local_ports.items()},
+        "connect_attempts_total": profile.connect_attempts_total,
+        "sessions_total": profile.sessions_total,
+        "reconnects_total": profile.reconnects_total,
+        "tunnel_uptime_seconds": _round1(profile.tunnel_uptime_seconds),
+        "tunnel_downtime_seconds": _round1(profile.tunnel_downtime_seconds),
+        "availability": _round1(profile.availability),
+        "current_session_at": profile.current_session_at,
+        "last_disconnect_at": profile.last_disconnect_at,
+        "last_disconnect_reason": profile.last_disconnect_reason,
+        "recent_events": profile.recent_events,
+    }
+
+
+def _status_payload(s) -> dict:  # noqa: ANN001 - DaemonStatus cycle guard
+    """Whole-daemon snapshot: process facts plus a map of profile → stats."""
+    return {
+        "running": True,
+        "pid": s.pid,
+        "started_at": s.started_at,
+        "uptime_seconds": round(s.uptime_seconds, 1),
+        "healthy": s.healthy,
+        "profiles": {
+            profile.name: _profile_payload(profile) for profile in s.profiles
+        },
+    }
 
 
 def _follow_log(path: str, start_offset: int) -> None:
@@ -365,56 +412,17 @@ def logs(
 # ---------------------------------------------------------------------------
 
 
-def _render_watch(s) -> RenderableType:  # noqa: ANN001 - DaemonStatus cycle guard
-    """Render one dashboard frame from a :class:`~ponte.daemon.DaemonStatus`."""
-    if not s.running:
-        grid = Table.grid(padding=(0, 2))
-        grid.add_row("[red]守护进程未运行[/red]（可 ponte start 启动）")
-        return Panel.fit(grid, title="ponte watch", border_style="red")
+def _profile_border(profile) -> str:  # noqa: ANN001 - ProfileStatus cycle guard
+    """Panel border colour for one profile's health flag."""
+    if profile.healthy is True:
+        return "green"
+    if profile.healthy is None:
+        return "yellow"
+    return "red"
 
-    table = Table.grid(padding=(0, 2))
-    table.add_row("PID", str(s.pid))
-    table.add_row("守护进程运行时长", s.uptime)
 
-    if s.healthy is True:
-        health_markup = "[green]健康[/green]"
-    elif s.healthy is None:
-        health_markup = "[yellow]未知[/yellow]"
-    else:
-        detail = escape(s.health_error or "")
-        health_markup = "[red]异常[/red]" + (f"（{detail}）" if detail else "")
-    table.add_row("健康状态", health_markup)
-
-    if s.current_session_at is not None:
-        session_up = _format_duration(time.time() - s.current_session_at)
-        table.add_row("当前会话", session_up)
-    else:
-        table.add_row("当前会话", "[red]已断开[/red]")
-
-    if s.sessions_total is not None:
-        avail = "—"
-        up = s.tunnel_uptime_seconds or 0.0
-        down = s.tunnel_downtime_seconds or 0.0
-        if up + down > 0:
-            avail = f"{(up / (up + down)) * 100:.1f}%"
-        table.add_row(
-            "会话统计",
-            f"会话 {s.sessions_total} · 重连 {s.reconnects_total} · 在线率 {avail}",
-        )
-
-    for port, ok in sorted(s.remote_ports.items()):
-        mark = "[green]监听中[/green]" if ok else "[red]未监听[/red]"
-        table.add_row(f"远程端口 {port}", mark)
-    for port, ok in sorted(s.local_ports.items()):
-        mark = "[green]监听中[/green]" if ok else "[red]未监听[/red]"
-        table.add_row(f"本地端口 {port}", mark)
-
-    if s.last_disconnect_reason:
-        since = ""
-        if s.last_disconnect_at is not None:
-            since = f"（{_format_duration(time.time() - s.last_disconnect_at)}前）"
-        table.add_row("上次断线", escape(s.last_disconnect_reason) + since)
-
+def _render_profile_feed(profile) -> RenderableType:  # noqa: ANN001 - cycle guard
+    """The bounded retry-event feed of one profile."""
     feed = Table(
         title="最近事件",
         title_style="dim",
@@ -423,7 +431,7 @@ def _render_watch(s) -> RenderableType:  # noqa: ANN001 - DaemonStatus cycle gua
     )
     feed.add_column(style="dim", no_wrap=True)
     feed.add_column()
-    for e in reversed(s.recent_events[-8:]):
+    for e in reversed(profile.recent_events[-8:]):
         etype = str(e.get("type", "?"))
         icon = {
             "connecting": "[dim]→[/dim]",
@@ -439,10 +447,73 @@ def _render_watch(s) -> RenderableType:  # noqa: ANN001 - DaemonStatus cycle gua
         elif e.get("attempt"):
             text = f"{etype}: 第 {e['attempt']} 次，{e.get('delay', 0):.1f}s 后重试"
         feed.add_row(f"{stamp}", f"{icon} {escape(text)}")
+    return feed
+
+
+def _render_profile_watch(profile) -> RenderableType:  # noqa: ANN001 - cycle guard
+    """One profile's dashboard block: statistics grid + event feed."""
+    table = Table.grid(padding=(0, 2))
+    table.add_row("健康状态", _markup_health(profile.healthy, profile.health_error))
+
+    if profile.current_session_at is not None:
+        table.add_row(
+            "当前会话", _format_duration(time.time() - profile.current_session_at)
+        )
+    else:
+        table.add_row("当前会话", "[red]已断开[/red]")
+
+    if profile.sessions_total is not None:
+        availability = profile.availability
+        avail = "—" if availability is None else f"{availability * 100:.1f}%"
+        table.add_row(
+            "会话统计",
+            f"会话 {profile.sessions_total} · 重连 {profile.reconnects_total} · 在线率 {avail}",
+        )
+
+    for port, ok in sorted(profile.remote_ports.items()):
+        table.add_row(f"远程端口 {port}", _markup_port(ok))
+    for port, ok in sorted(profile.local_ports.items()):
+        table.add_row(f"本地端口 {port}", _markup_port(ok))
+
+    if profile.last_disconnect_reason:
+        since = ""
+        if profile.last_disconnect_at is not None:
+            since = f"（{_format_duration(time.time() - profile.last_disconnect_at)}前）"
+        table.add_row("上次断线", escape(profile.last_disconnect_reason) + since)
+
+    if profile.error:
+        table.add_row("错误", f"[red]{escape(profile.error)}[/red]")
 
     body = Table.grid()
-    body.add_row(Panel.fit(table, title="ponte 状态", border_style="cyan"))
-    body.add_row(feed)
+    body.add_row(table)
+    body.add_row(_render_profile_feed(profile))
+    return body
+
+
+def _render_watch(s) -> RenderableType:  # noqa: ANN001 - DaemonStatus cycle guard
+    """Render one dashboard frame from a :class:`~ponte.daemon.DaemonStatus`.
+
+    A single-profile config keeps the original one-panel layout; with several
+    profiles each one gets its own panel, so two tunnels can be compared
+    side by side instead of being flattened into one set of numbers.
+    """
+    if not s.running:
+        grid = Table.grid(padding=(0, 2))
+        grid.add_row("[red]守护进程未运行[/red]（可 ponte start 启动）")
+        return Panel.fit(grid, title="ponte watch", border_style="red")
+
+    body = Table.grid()
+    multiple = len(s.profiles) > 1
+    for profile in s.profiles:
+        block: RenderableType = _render_profile_watch(profile)
+        if multiple:
+            block = Panel(
+                block,
+                title=f"隧道 {profile.name}",
+                border_style=_profile_border(profile),
+            )
+        body.add_row(block)
+
     return Panel(
         body,
         title=f"ponte watch — pid {s.pid}",
@@ -483,14 +554,23 @@ def watch(
 @app.command()
 def test(
     timeout: int = typer.Option(10, "--timeout", help="连接测试超时（秒）"),
+    profile: str | None = typer.Option(
+        None, "--profile", "-P", help="只测试指定 profile（默认逐条全部测试）"
+    ),
 ) -> None:
     """测试到 SSH 服务器的连接是否正常。"""
     try:
-        ok = _daemon().test_connection(timeout=timeout)
-        if ok:
-            console.print("[green]连接正常 OK[/green]")
-        else:
-            console.print("[red]连接失败[/red]")
+        daemon = _daemon()
+        names = [profile] if profile else daemon.profile_names
+        failed: list[str] = []
+        for name in names:
+            label = "" if len(names) == 1 else f"{name}："
+            if daemon.test_connection(timeout=timeout, profile=name):
+                console.print(f"[green]{escape(label)}连接正常 OK[/green]")
+            else:
+                console.print(f"[red]{escape(label)}连接失败[/red]")
+                failed.append(name)
+        if failed:
             raise typer.Exit(code=1)
     except typer.Exit:
         raise
@@ -501,21 +581,27 @@ def test(
 @app.command()
 def check(
     timeout: int = typer.Option(10, "--timeout", help="端口检查超时（秒）"),
+    profile: str | None = typer.Option(
+        None, "--profile", "-P", help="只检查指定 profile（默认逐条检查）"
+    ),
 ) -> None:
     """检查隧道端口：``-R`` 在服务器上、``-L``/``-D`` 在本机。"""
     try:
         daemon = _daemon()
-        remote = daemon.check_remote_ports(timeout=timeout)
-        local = daemon.check_local_ports()
-        if not remote and not local:
+        names = [profile] if profile else daemon.profile_names
+        any_port = False
+        for name in names:
+            label = "" if len(names) == 1 else f"{name} "
+            remote = daemon.check_remote_ports(timeout=timeout, profile=name)
+            local = daemon.check_local_ports(profile=name)
+            for port, ok in sorted(remote.items()):
+                any_port = True
+                console.print(f"{label}远程端口 {port}: {_markup_port(ok)}")
+            for port, ok in sorted(local.items()):
+                any_port = True
+                console.print(f"{label}本地端口 {port}: {_markup_port(ok)}")
+        if not any_port:
             console.print("[yellow]没有任何配置的隧道端口[/yellow]")
-            raise typer.Exit(code=0)
-        for port, ok in sorted(remote.items()):
-            mark = "[green]监听中[/green]" if ok else "[red]未监听[/red]"
-            console.print(f"远程端口 {port}: {mark}")
-        for port, ok in sorted(local.items()):
-            mark = "[green]监听中[/green]" if ok else "[red]未监听[/red]"
-            console.print(f"本地端口 {port}: {mark}")
     except typer.Exit:
         raise
     except Exception as exc:
@@ -569,13 +655,18 @@ def config() -> None:
         table.add_column("键", no_wrap=True, style="cyan")
         table.add_column("值")
 
-        table.add_row("服务器", f"{cfg.ssh.user}@{cfg.ssh.host}")
-        table.add_row("SSH 端口", str(cfg.ssh.port))
-        tunnel_lines = [
-            t.summary + (f"  ({escape(t.description)})" if t.description else "")
-            for t in cfg.tunnels
-        ]
-        table.add_row("隧道", "\n".join(tunnel_lines) or "（无）")
+        multiple = len(cfg.profiles) > 1
+        for profile in cfg.profiles:
+            prefix = f"{profile.name} · " if multiple else ""
+            table.add_row(
+                f"{prefix}服务器", f"{profile.ssh.user}@{profile.ssh.host}"
+            )
+            table.add_row(f"{prefix}SSH 端口", str(profile.ssh.port))
+            tunnel_lines = [
+                t.summary + (f"  ({escape(t.description)})" if t.description else "")
+                for t in profile.tunnels
+            ]
+            table.add_row(f"{prefix}隧道", "\n".join(tunnel_lines) or "（无）")
         table.add_row(
             "retry",
             f"max_retries={retry.max_retries}, base_delay={retry.base_delay}s, "

@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 
-from ponte.config import WILDCARD_HOSTS, TunnelConfig, get_config
+from ponte.config import WILDCARD_HOSTS, Profile, TunnelConfig, get_config
 
 __all__ = ["TunnelManager", "creation_flags"]
 
@@ -106,12 +106,22 @@ def _find_ssh(config: TunnelConfig | None = None) -> str:
 class TunnelManager:
     """Manage a single SSH tunnel session (reverse, local and/or SOCKS).
 
+    One manager drives exactly one SSH connection, i.e. one
+    :class:`~ponte.config.Profile`. When the config holds several profiles the
+    daemon builds one manager per profile and supervises them concurrently.
+
     Parameters:
         config: A validated :class:`TunnelConfig` (from ``ponte.config``).
+        profile: Which profile to connect to. Defaults to the primary one
+            (``config.profiles[0]``), which is what every single-tunnel caller
+            wants.
     """
 
-    def __init__(self, config: TunnelConfig) -> None:
+    def __init__(self, config: TunnelConfig, profile: Profile | None = None) -> None:
         self.config = config
+        self.profile = profile if profile is not None else config.profiles[0]
+        # Windows ``ssh_exe`` is a host-level setting, so the *global* config is
+        # what _find_ssh needs — not the profile.
         self.ssh_exe = _find_ssh(self.config)
         self.process: subprocess.Popen | None = None
         # Session-duration bookkeeping, consumed by the retry layer to reset
@@ -232,7 +242,7 @@ class TunnelManager:
              "-L", "127.0.0.1:8080:db.internal:5432",
              "-D", "127.0.0.1:1080", "user@server-ip"]
         """
-        cfg = self.config.ssh
+        cfg = self.profile.ssh
         args = [self.ssh_exe]
 
         # SSH options
@@ -254,7 +264,7 @@ class TunnelManager:
         args.append("-N")
 
         # Forwarding rules: -R (server listens), -L (we listen), -D (SOCKS proxy)
-        for tunnel in self.config.tunnels:
+        for tunnel in self.profile.tunnels:
             args.extend([tunnel.flag, tunnel.spec])
 
         # Destination
@@ -264,11 +274,10 @@ class TunnelManager:
     # -- Health / diagnostics -----------------------------------------------
 
     def test_connection(self, timeout: int = 10) -> bool:
-        """Run a quick ``ssh … echo OK`` to verify connectivity.
-
-        Returns ``True`` if the server responds with "OK".
+        """Run a quick ``ssh … echo OK`` to verify connectivity.        Returns
+            ``True`` if the server responds with "OK".
         """
-        cfg = self.config.ssh
+        cfg = self.profile.ssh
         args = [self.ssh_exe]
         for key, value in cfg.options.as_pairs():
             args.extend(["-o", f"{key}={value}"])
@@ -307,10 +316,10 @@ class TunnelManager:
         far cheaper :meth:`check_local_ports`). Returns ``{}`` — never a probe
         connection — when no remote tunnel is configured.
         """
-        cfg = self.config.ssh
+        cfg = self.profile.ssh
         ports = {
             int(t.remote_port)
-            for t in self.config.tunnels
+            for t in self.profile.tunnels
             if t.is_remote and t.remote_port is not None
         }
         if not ports:
@@ -389,7 +398,7 @@ class TunnelManager:
         whenever the wildcard bind succeeded.
         """
         status: dict[int, bool] = {}
-        for tunnel in self.config.tunnels:
+        for tunnel in self.profile.tunnels:
             if tunnel.is_remote:
                 continue
             host = tunnel.local_host
