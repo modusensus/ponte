@@ -10,7 +10,14 @@ import subprocess
 import sys
 import time
 
-from ponte.config import SSHConfig, SSHOptions, Tunnel, TunnelConfig, WindowsConfig
+from ponte.config import (
+    Profile,
+    SSHConfig,
+    SSHOptions,
+    Tunnel,
+    TunnelConfig,
+    WindowsConfig,
+)
 from ponte.core import TunnelManager, _find_ssh, creation_flags
 
 # ``CREATE_NO_WINDOW`` is a Windows-only constant missing from ``subprocess``
@@ -24,17 +31,22 @@ def _cfg(*, host: str = "example.com", user: str = "testuser", port: int = 22,
          ssh_exe: str = "/usr/bin/ssh",
          tunnels: list[Tunnel] | None = None) -> TunnelConfig:
     return TunnelConfig(
-        ssh=SSHConfig(
-            host=host,
-            user=user,
-            identity_file="/keys/id_rsa",
-            port=port,
-            known_hosts_file="/keys/known_hosts",
-            options=SSHOptions(),
-        ),
-        tunnels=tunnels if tunnels is not None else [
-            Tunnel(remote_port=23334, local_host="localhost", local_port=2222),
-            Tunnel(remote_port=17897, local_host="localhost", local_port=7897),
+        profiles=[
+            Profile(
+                name="default",
+                ssh=SSHConfig(
+                    host=host,
+                    user=user,
+                    identity_file="/keys/id_rsa",
+                    port=port,
+                    known_hosts_file="/keys/known_hosts",
+                    options=SSHOptions(),
+                ),
+                tunnels=tunnels if tunnels is not None else [
+                    Tunnel(remote_port=23334, local_host="localhost", local_port=2222),
+                    Tunnel(remote_port=17897, local_host="localhost", local_port=7897),
+                ],
+            )
         ],
         windows=WindowsConfig(ssh_exe=ssh_exe),
     )

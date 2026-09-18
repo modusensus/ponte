@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import sys
 import tomllib
@@ -43,6 +44,8 @@ __all__ = [
     "Tunnel",
     "TUNNEL_FLAGS",
     "DEFAULT_BIND_HOST",
+    "Profile",
+    "DEFAULT_PROFILE_NAME",
     "DaemonConfig",
     "RetryConfig",
     "HealthConfig",
@@ -84,6 +87,14 @@ DEFAULT_BIND_HOST = "127.0.0.1"
 
 #: ``local_host`` values that mean "every interface" and cannot be connected to.
 WILDCARD_HOSTS = frozenset({"0.0.0.0", "::", "*"})
+
+#: Name given to the implicit profile of a pre-``profiles`` config file.
+DEFAULT_PROFILE_NAME = "default"
+
+#: Characters allowed in a profile name. Deliberately narrow because the name
+#: ends up in pid/status file names, a systemd instance (``ponte@web``) and a
+#: Windows task name: anything exotic there becomes a quoting bug.
+PROFILE_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 
 # Pathlike inputs accepted by get_config/load_config.
 _Path = str | os.PathLike[str]
@@ -220,6 +231,29 @@ class Tunnel:
         if self.remote_host:
             line += f"（服务器绑定 {self.remote_host}）"
         return line
+
+
+@dataclass(frozen=True)
+class Profile:
+    """A named SSH endpoint plus the forwarding rules it carries.
+
+    Every profile is supervised independently by the daemon: its own SSH
+    connection, reconnect budget, health checks and section of the status file —
+    so one unreachable server no longer takes the other tunnels down with it.
+
+    A config file that still uses the single-tunnel layout (top-level ``[ssh]``
+    plus ``[[tunnels]]``) is parsed into exactly one profile named
+    :data:`DEFAULT_PROFILE_NAME`, which keeps old configs working verbatim.
+    """
+
+    name: str
+    ssh: SSHConfig
+    tunnels: list[Tunnel]
+
+    @property
+    def destination(self) -> str:
+        """The ``user@host`` target passed to ``ssh``."""
+        return self.ssh.destination
 
 
 @dataclass(frozen=True)
@@ -494,10 +528,15 @@ def init_config(path: _Path | None = None, *, force: bool = False) -> str:
 
 @dataclass(frozen=True)
 class TunnelConfig:
-    """Top-level validated configuration for the tool."""
+    """Top-level validated configuration for the tool.
 
-    ssh: SSHConfig
-    tunnels: list[Tunnel]
+    ``retry`` and ``health`` are *policy* and therefore shared by every profile;
+    the file is small enough that a per-profile override would be more
+    configuration than it is worth. Everything connection-shaped lives in
+    :attr:`profiles`.
+    """
+
+    profiles: list[Profile]
     daemon: DaemonConfig = field(default_factory=DaemonConfig)
     retry: RetryConfig = field(default_factory=RetryConfig)
     health: HealthConfig = field(default_factory=HealthConfig)
@@ -512,6 +551,43 @@ class TunnelConfig:
     being silently dropped — a typo in a config key used to have no effect and
     no diagnostic.
     """
+
+    @property
+    def ssh(self) -> SSHConfig:
+        """Connection of the *primary* profile (``profiles[0]``).
+
+        Kept so single-profile callers (and the ``ponte`` CLI paths that only
+        ever talk to one server) do not have to index the list.
+        """
+        return self.profiles[0].ssh
+
+    @property
+    def tunnels(self) -> list[Tunnel]:
+        """Forwarding rules of the *primary* profile (``profiles[0]``)."""
+        return self.profiles[0].tunnels
+
+    @property
+    def profile_names(self) -> list[str]:
+        """Profile names, in configuration order."""
+        return [profile.name for profile in self.profiles]
+
+    def get_profile(self, name: str | None = None) -> Profile:
+        """Return the profile called *name*, or the primary one when ``None``.
+
+        Raises:
+            ConfigError: when *name* matches no configured profile. Listing the
+                configured names matters: ``--profile`` typos are otherwise
+                indistinguishable from "the tunnel is broken".
+        """
+        if name is None:
+            return self.profiles[0]
+        for profile in self.profiles:
+            if profile.name == name:
+                return profile
+        raise ConfigError(
+            f"unknown profile {name!r}; configured profiles: "
+            + ", ".join(self.profile_names)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -575,8 +651,7 @@ def _parse_config(data: Mapping[str, Any], config_path: str) -> TunnelConfig:
     warnings: list[str] = []
     _warn_unknown_keys(data, _KNOWN_TOP_LEVEL, "", warnings)
 
-    ssh = _parse_ssh(data.get("ssh", {}), warnings)
-    tunnels = _parse_tunnels(data.get("tunnels", []), warnings)
+    profiles = _parse_profiles(data, warnings)
     daemon = _parse_daemon(data.get("daemon", {}), warnings)
     retry = _parse_retry(data.get("retry", {}), warnings)
     health = _parse_health(data.get("health", {}), warnings)
@@ -584,8 +659,7 @@ def _parse_config(data: Mapping[str, Any], config_path: str) -> TunnelConfig:
     service = _parse_service(data.get("service", {}), warnings)
 
     cfg = TunnelConfig(
-        ssh=ssh,
-        tunnels=tunnels,
+        profiles=profiles,
         daemon=daemon,
         retry=retry,
         health=health,
@@ -603,8 +677,9 @@ def _parse_config(data: Mapping[str, Any], config_path: str) -> TunnelConfig:
 #: Recognised keys per section. Used to report typos instead of silently
 #: ignoring them; ``ssh.options`` is intentionally open-ended.
 _KNOWN_TOP_LEVEL = frozenset(
-    {"ssh", "tunnels", "daemon", "retry", "health", "windows", "service"}
+    {"ssh", "tunnels", "profiles", "daemon", "retry", "health", "windows", "service"}
 )
+_KNOWN_PROFILE = frozenset({"name", "ssh", "tunnels"})
 _KNOWN_SSH = frozenset(
     {"host", "port", "user", "identity_file", "known_hosts_file", "options"}
 )
@@ -643,15 +718,75 @@ def _warn_unknown_keys(
             warnings.append(f"未知配置项 '{prefix}{key}' 已忽略（请检查拼写）")
 
 
-def _parse_ssh(section: Any, warnings: list[str] | None = None) -> SSHConfig:
-    _expect_table(section, "ssh")
-    _warn_unknown_keys(section, _KNOWN_SSH, "ssh", warnings)
-    host = _require_str(section, "host", "ssh")
-    user = _require_str(section, "user", "ssh")
-    identity_file = _require_str(section, "identity_file", "ssh")
-    port = _optional_int(section, "port", default=22, minimum=1, maximum=65535, where="ssh")
+def _parse_profiles(data: Mapping[str, Any], warnings: list[str]) -> list[Profile]:
+    """Return the configured profiles, synthesizing one for legacy layouts.
+
+    Two accepted shapes:
+
+    * ``[[profiles]]`` — each entry carries its own ``[profiles.ssh]`` and
+      ``[[profiles.tunnels]]`` sub-tables (the multi-tunnel layout);
+    * top-level ``[ssh]`` + ``[[tunnels]]`` — the pre-``profiles`` layout, which
+      becomes a single profile named :data:`DEFAULT_PROFILE_NAME`.
+
+    Mixing the two is rejected rather than guessed at: which connection the
+    top-level ``[[tunnels]]`` would belong to is genuinely ambiguous.
+    """
+    section = data.get("profiles")
+    legacy_present = "ssh" in data or "tunnels" in data
+
+    if section is None:
+        ssh = _parse_ssh(data.get("ssh", {}), warnings)
+        tunnels = _parse_tunnels(data.get("tunnels", []), warnings)
+        return [Profile(name=DEFAULT_PROFILE_NAME, ssh=ssh, tunnels=tunnels)]
+
+    if legacy_present:
+        raise ConfigValidationError(
+            "'profiles' cannot be combined with top-level [ssh] / [[tunnels]]; "
+            "move the connection settings into the profile entries"
+        )
+    if not isinstance(section, list):
+        raise ConfigValidationError("'profiles' must be an array of tables")
+    if not section:
+        raise ConfigValidationError("'profiles' must contain at least one profile")
+
+    profiles: list[Profile] = []
+    seen: set[str] = set()
+    for index, item in enumerate(section):
+        where = f"profiles[{index}]"
+        _expect_table(item, where)
+        _warn_unknown_keys(item, _KNOWN_PROFILE, where, warnings)
+        name = _require_str(item, "name", where)
+        if not PROFILE_NAME_PATTERN.fullmatch(name):
+            raise ConfigValidationError(
+                f"Field '{where}.name' may only contain letters, digits, '_', "
+                f"'-' and '.', and must not start with a separator (got {name!r})"
+            )
+        if name in seen:
+            raise ConfigValidationError(f"Duplicate profile name {name!r} at {where}")
+        seen.add(name)
+        ssh = _parse_ssh(item.get("ssh", {}), warnings, where=f"{where}.ssh")
+        tunnels = _parse_tunnels(
+            item.get("tunnels", []), warnings, prefix=f"{where}.tunnels"
+        )
+        profiles.append(Profile(name=name, ssh=ssh, tunnels=tunnels))
+    return profiles
+
+
+def _parse_ssh(
+    section: Any, warnings: list[str] | None = None, where: str = "ssh"
+) -> SSHConfig:
+    """Parse a ``[ssh]`` table. *where* is the prefix used in messages, so a
+    profile's section reports ``profiles[0].ssh.host`` rather than ``ssh.host``."""
+    _expect_table(section, where)
+    _warn_unknown_keys(section, _KNOWN_SSH, where, warnings)
+    host = _require_str(section, "host", where)
+    user = _require_str(section, "user", where)
+    identity_file = _require_str(section, "identity_file", where)
+    port = _optional_int(
+        section, "port", default=22, minimum=1, maximum=65535, where=where
+    )
     known_hosts = _optional_str(section, "known_hosts_file", None)
-    options = _parse_ssh_options(section.get("options", {}))
+    options = _parse_ssh_options(section.get("options", {}), where=f"{where}.options")
     return SSHConfig(
         host=host,
         user=user,
@@ -662,31 +797,33 @@ def _parse_ssh(section: Any, warnings: list[str] | None = None) -> SSHConfig:
     )
 
 
-def _parse_ssh_options(section: Any) -> SSHOptions:
+def _parse_ssh_options(section: Any, where: str = "ssh.options") -> SSHOptions:
     dft = SSHOptions()
     if not section:
         return dft
-    _expect_table(section, "ssh.options")
+    _expect_table(section, where)
     kwargs: dict[str, Any] = {}
     extra: list[tuple[str, str]] = []
     for key, raw_value in section.items():
         expected = _FIELD_TYPES.get(key)
         if expected is not None:
-            kwargs[key] = _coerce(raw_value, expected, f"ssh.options.{key}")
+            kwargs[key] = _coerce(raw_value, expected, f"{where}.{key}")
         else:
             extra.append((key, _option_str(raw_value)))
     merged = {**vars(dft), **kwargs, "extra": tuple(extra)}
     return SSHOptions(**merged)
 
 
-def _parse_tunnels(section: Any, warnings: list[str] | None = None) -> list[Tunnel]:
+def _parse_tunnels(
+    section: Any, warnings: list[str] | None = None, prefix: str = "tunnels"
+) -> list[Tunnel]:
     if not section:
         return []
     if not isinstance(section, list):
-        raise ConfigValidationError("'tunnels' must be an array of tables")
+        raise ConfigValidationError(f"'{prefix}' must be an array of tables")
     tunnels: list[Tunnel] = []
     for index, item in enumerate(section):
-        where = f"tunnels[{index}]"
+        where = f"{prefix}[{index}]"
         _expect_table(item, where)
         _warn_unknown_keys(item, _KNOWN_TUNNEL, where, warnings)
         kind = _optional_str(item, "kind", default="remote")
@@ -852,21 +989,37 @@ def _parse_service(section: Any, warnings: list[str] | None = None) -> ServiceCo
 
 def _validate(cfg: TunnelConfig) -> None:
     """Cross-field validation that runs after every section is parsed."""
-    if not cfg.tunnels:
-        raise ConfigValidationError("At least one tunnel must be configured under 'tunnels'")
+    if not cfg.profiles:
+        raise ConfigValidationError("At least one profile must be configured")
 
-    _reject_duplicate_listeners(cfg.tunnels)
+    for profile in cfg.profiles:
+        where = (
+            "tunnels"
+            if profile.name == DEFAULT_PROFILE_NAME and len(cfg.profiles) == 1
+            else f"profile {profile.name!r}"
+        )
+        if not profile.tunnels:
+            raise ConfigValidationError(
+                f"At least one tunnel must be configured for {where}"
+            )
+        # Duplicate listeners are checked per profile: two different servers may
+        # both expose port 23334, and that is not a conflict.
+        _reject_duplicate_listeners(profile.tunnels)
 
-    # The identity file is essential for non-interactive operation; fail fast
-    # with a clear message rather than letting SSH fail later.
-    if cfg.ssh.identity_file and not os.path.isfile(cfg.ssh.identity_file):
-        raise ConfigValidationError(
-            f"SSH identity file does not exist: {cfg.ssh.identity_file}"
-        )
-    if cfg.ssh.known_hosts_file and not os.path.isfile(cfg.ssh.known_hosts_file):
-        raise ConfigValidationError(
-            f"Known-hosts file does not exist: {cfg.ssh.known_hosts_file}"
-        )
+        # The identity file is essential for non-interactive operation; fail
+        # fast with a clear message rather than letting SSH fail later.
+        if profile.ssh.identity_file and not os.path.isfile(profile.ssh.identity_file):
+            raise ConfigValidationError(
+                f"SSH identity file does not exist: {profile.ssh.identity_file}"
+                + (f" (profile {profile.name!r})" if len(cfg.profiles) > 1 else "")
+            )
+        if profile.ssh.known_hosts_file and not os.path.isfile(
+            profile.ssh.known_hosts_file
+        ):
+            raise ConfigValidationError(
+                f"Known-hosts file does not exist: {profile.ssh.known_hosts_file}"
+                + (f" (profile {profile.name!r})" if len(cfg.profiles) > 1 else "")
+            )
 
 
 def _reject_duplicate_listeners(tunnels: list[Tunnel]) -> None:

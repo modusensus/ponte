@@ -11,6 +11,7 @@ from typer.testing import CliRunner
 from ponte import __version__
 from ponte.config import (
     HealthConfig,
+    Profile,
     RetryConfig,
     SSHConfig,
     SSHOptions,
@@ -18,27 +19,41 @@ from ponte.config import (
     TunnelConfig,
     WindowsConfig,
 )
-from ponte.daemon import DaemonStatus
+from ponte.daemon import DaemonStatus, ProfileStatus
 from ponte.main import app
 
 
 def _cfg() -> TunnelConfig:
     return TunnelConfig(
-        ssh=SSHConfig(
-            host="example.com",
-            user="testuser",
-            identity_file="/keys/id_rsa",
-            known_hosts_file="/keys/known_hosts",
-            options=SSHOptions(),
-        ),
-        tunnels=[Tunnel(remote_port=23334, local_host="localhost", local_port=2222)],
+        profiles=[
+            Profile(
+                name="default",
+                ssh=SSHConfig(
+                    host="example.com",
+                    user="testuser",
+                    identity_file="/keys/id_rsa",
+                    known_hosts_file="/keys/known_hosts",
+                    options=SSHOptions(),
+                ),
+                tunnels=[
+                    Tunnel(remote_port=23334, local_host="localhost", local_port=2222)
+                ],
+            )
+        ],
         retry=RetryConfig(max_retries=0, base_delay=5.0),
         health=HealthConfig(check_interval=60),
         windows=WindowsConfig(ssh_exe="/usr/bin/ssh"),
     )
 
 
+def _status(*profiles: ProfileStatus, **kwargs) -> DaemonStatus:
+    """Build a :class:`DaemonStatus` from one or more profile snapshots."""
+    return DaemonStatus(profiles=list(profiles), **kwargs)
+
+
 class _FakeDaemon:
+    profile_names = ["default"]
+
     def __init__(self, *, running: bool = False) -> None:
         self._running = running
         self.log_file = "/tmp/nonexistent-ponte.log"
@@ -116,22 +131,25 @@ def test_status_json_running(monkeypatch) -> None:
     """--json 输出机器可读统计（脚本/监控消费的契约）。"""
     import json as _json
 
-    s = DaemonStatus(
+    s = _status(
+        ProfileStatus(
+            name="default",
+            healthy=True,
+            remote_ports={23334: True},
+            connect_attempts_total=5,
+            sessions_total=4,
+            reconnects_total=3,
+            tunnel_uptime_seconds=400.0,
+            tunnel_downtime_seconds=100.0,
+            current_session_at=1000.0,
+            last_disconnect_at=900.0,
+            last_disconnect_reason="ssh exited with code 255",
+            recent_events=[{"at": 900.0, "type": "disconnected", "reason": "x"}],
+        ),
         running=True,
         pid=4321,
         started_at=1000.0,
         uptime_seconds=60.0,
-        healthy=True,
-        remote_ports={23334: True},
-        connect_attempts_total=5,
-        sessions_total=4,
-        reconnects_total=3,
-        tunnel_uptime_seconds=400.0,
-        tunnel_downtime_seconds=100.0,
-        current_session_at=1000.0,
-        last_disconnect_at=900.0,
-        last_disconnect_reason="ssh exited with code 255",
-        recent_events=[{"at": 900.0, "type": "disconnected", "reason": "x"}],
     )
 
     class _Daemon:
@@ -145,26 +163,35 @@ def test_status_json_running(monkeypatch) -> None:
     assert payload["running"] is True
     assert payload["pid"] == 4321
     assert payload["healthy"] is True
-    assert payload["remote_ports"] == {"23334": True}
-    assert payload["sessions_total"] == 4
-    assert payload["reconnects_total"] == 3
-    assert payload["tunnel_uptime_seconds"] == 400.0
-    assert payload["last_disconnect_reason"] == "ssh exited with code 255"
-    assert payload["recent_events"][0]["type"] == "disconnected"
+    assert payload["profiles"]["default"]["remote_ports"] == {"23334": True}
+    assert payload["profiles"]["default"]["sessions_total"] == 4
+    assert payload["profiles"]["default"]["reconnects_total"] == 3
+    assert payload["profiles"]["default"]["tunnel_uptime_seconds"] == 400.0
+    assert payload["profiles"]["default"]["availability"] == 0.8
+    assert (
+        payload["profiles"]["default"]["last_disconnect_reason"]
+        == "ssh exited with code 255"
+    )
+    assert payload["profiles"]["default"]["recent_events"][0]["type"] == (
+        "disconnected"
+    )
 
 
 def test_status_table_shows_tunnel_stats(monkeypatch) -> None:
     """默认表格输出包含会话统计与上次断线原因（信息缺口修复）。"""
-    s = DaemonStatus(
+    s = _status(
+        ProfileStatus(
+            name="default",
+            healthy=True,
+            remote_ports={23334: True},
+            sessions_total=4,
+            reconnects_total=3,
+            current_session_at=time.time() - 120,
+            last_disconnect_reason="ssh exited with code 255",
+        ),
         running=True,
         pid=1234,
         uptime_seconds=3600.0,
-        healthy=True,
-        remote_ports={23334: True},
-        sessions_total=4,
-        reconnects_total=3,
-        current_session_at=time.time() - 120,
-        last_disconnect_reason="ssh exited with code 255",
     )
 
     class _Daemon:
@@ -183,27 +210,30 @@ def test_watch_renders_dashboard(monkeypatch) -> None:
     """watch 看板：一帧渲染包含健康、会话与事件流（不进入死循环）。"""
     from ponte.main import _render_watch, console
 
-    s = DaemonStatus(
+    s = _status(
+        ProfileStatus(
+            name="default",
+            healthy=True,
+            remote_ports={23334: True},
+            sessions_total=2,
+            reconnects_total=1,
+            tunnel_uptime_seconds=300.0,
+            tunnel_downtime_seconds=30.0,
+            current_session_at=time.time() - 60,
+            last_disconnect_reason="connection reset",
+            recent_events=[
+                {"at": time.time(), "type": "connected"},
+                {
+                    "at": time.time(),
+                    "type": "disconnected",
+                    "reason": "connection reset",
+                },
+                {"at": time.time(), "type": "retrying", "attempt": 1, "delay": 2.0},
+            ],
+        ),
         running=True,
         pid=1234,
         uptime_seconds=3600.0,
-        healthy=True,
-        remote_ports={23334: True},
-        sessions_total=2,
-        reconnects_total=1,
-        tunnel_uptime_seconds=300.0,
-        tunnel_downtime_seconds=30.0,
-        current_session_at=time.time() - 60,
-        last_disconnect_reason="connection reset",
-        recent_events=[
-            {"at": time.time(), "type": "connected"},
-            {
-                "at": time.time(),
-                "type": "disconnected",
-                "reason": "connection reset",
-            },
-            {"at": time.time(), "type": "retrying", "attempt": 1, "delay": 2.0},
-        ],
     )
     with console.capture() as capture:
         console.print(_render_watch(s))
@@ -241,15 +271,21 @@ class _FakeDaemonWithActions:
         self.log_file = ""
         self.stopped = False
         self.started = False
+        self.profile_names = ["default"]
 
     def status(self) -> DaemonStatus:
         return DaemonStatus(
             running=self._running,
             pid=1234 if self._running else None,
             uptime_seconds=10,
-            healthy=True,
-            remote_ports=self._ports,
-            local_ports=self._local_ports,
+            profiles=[
+                ProfileStatus(
+                    name="default",
+                    healthy=True,
+                    remote_ports=self._ports,
+                    local_ports=self._local_ports,
+                )
+            ],
         )
 
     def start(self, foreground: bool = False) -> int:
@@ -264,13 +300,17 @@ class _FakeDaemonWithActions:
         self.stopped = True
         return DaemonStatus(running=False, message="killed")
 
-    def test_connection(self, timeout: int = 10) -> bool:
+    def test_connection(self, timeout: int = 10, profile: str | None = None) -> bool:
         return self._test_ok
 
-    def check_remote_ports(self, timeout: int = 10) -> dict[int, bool]:
+    def check_remote_ports(
+        self, timeout: int = 10, profile: str | None = None
+    ) -> dict[int, bool]:
         return self._ports
 
-    def check_local_ports(self, timeout: float = 1.0) -> dict[int, bool]:
+    def check_local_ports(
+        self, timeout: float = 1.0, profile: str | None = None
+    ) -> dict[int, bool]:
         return self._local_ports
 
     def install_service(self) -> str:
@@ -358,13 +398,16 @@ def test_status_and_watch_render_local_ports(monkeypatch) -> None:
     """本地端口在 status 表格与 watch 看板里各有独立一行。"""
     from ponte.main import _render_watch, console
 
-    s = DaemonStatus(
+    s = _status(
+        ProfileStatus(
+            name="default",
+            healthy=False,
+            remote_ports={23334: True},
+            local_ports={1080: False},
+        ),
         running=True,
         pid=1,
         uptime_seconds=10.0,
-        healthy=False,
-        remote_ports={23334: True},
-        local_ports={1080: False},
     )
 
     class _Daemon:
@@ -385,7 +428,9 @@ def test_status_json_includes_local_ports(monkeypatch) -> None:
     """--json 契约里也带上本地端口（监控系统消费）。"""
     import json as _json
 
-    s = DaemonStatus(running=True, pid=7, local_ports={1080: True})
+    s = _status(
+        ProfileStatus(name="default", local_ports={1080: True}), running=True, pid=7
+    )
 
     class _Daemon:
         def status(self) -> DaemonStatus:
@@ -394,7 +439,8 @@ def test_status_json_includes_local_ports(monkeypatch) -> None:
     monkeypatch.setattr("ponte.main._daemon", lambda: _Daemon())
     result = CliRunner().invoke(app, ["status", "--json"])
     assert result.exit_code == 0
-    assert _json.loads(result.output)["local_ports"] == {"1080": True}
+    payload = _json.loads(result.output)
+    assert payload["profiles"]["default"]["local_ports"] == {"1080": True}
 
 
 def test_install_command(monkeypatch) -> None:

@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`ponte status --json` is now keyed by profile.** That contract was added in
+  this same unreleased cycle, so nothing released depends on it: instead of one
+  flat object of tunnel statistics the payload is
+  `{running, pid, uptime_seconds, healthy, profiles: {<name>: {...}}}`, with
+  `availability` spelled out per profile.
 - **Duplicate listen ports are now a configuration error.** Every forward is
   established with `ExitOnForwardFailure=yes`, so a repeated `remote_port`, or
   an `-L`/`-D` pair sharing a local port, made OpenSSH drop the *whole*
@@ -33,6 +38,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Multiple SSH endpoints in one config: `[[profiles]]`.** A profile is a
+  named SSH endpoint with its own key and its own `[[profiles.tunnels]]`, and a
+  single daemon supervises every one of them concurrently — each with its own
+  connection, reconnect budget, health monitor and section of the status file.
+  A server that is down now backs off alone instead of taking the other tunnels
+  with it, and a profile whose retry loop dies of an unexpected exception is
+  recorded in the status file (and shown by `status`/`watch`) rather than dying
+  silently. `ponte status` prints one table per profile (unchanged layout for a
+  single tunnel), `ponte watch` one panel per profile, and `ponte test` /
+  `ponte check` gained `--profile NAME` to target one of them. The pre-profile
+  layout is still read as a single profile named `default`, including an
+  already-written status file, so an in-place upgrade keeps its statistics.
 - **`-L` (local) and `-D` (SOCKS5) forwarding, not just `-R`.** A `[[tunnels]]`
   rule now takes `kind = "remote" | "local" | "dynamic"` — `remote` is the
   default, so existing configs parse and behave exactly as before — and ponte

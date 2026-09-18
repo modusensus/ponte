@@ -68,6 +68,39 @@ description = "示例：把远端 23334 转发到本地 2222"
 # local_port = 1080
 # description = "示例：本机 SOCKS5 代理"
 
+# ---------------------------------------------------------------------------
+# 多隧道：一个守护进程监督多条 SSH 连接
+#
+# 与上面的顶层 [ssh] + [[tunnels]] 二选一。写了 [[profiles]] 就要把连接参数全部
+# 搬进各 profile；两者混用会被直接拒绝（顶层 [[tunnels]] 到底属于哪条连接是有歧义
+# 的）。retry / health / daemon / service 仍是全局策略，所有 profile 共用。
+#
+# 每条 profile 各自重连、各自健康检查，互不影响；ponte status 与 ponte watch
+# 会按 profile 分行展示，ponte test / check 可用 --profile NAME 只看一条。
+#
+# [[profiles]]
+# name = "web"
+#   [profiles.ssh]
+#   host = "YOUR_SERVER_IP"
+#   user = "YOUR_SSH_USER"
+#   identity_file = "~/.ssh/id_rsa"
+#   [[profiles.tunnels]]
+#   remote_port = 8080
+#   local_host = "127.0.0.1"
+#   local_port = 80
+#
+# [[profiles]]
+# name = "db"
+#   [profiles.ssh]
+#   host = "OTHER_SERVER_IP"
+#   user = "YOUR_SSH_USER"
+#   identity_file = "~/.ssh/id_rsa"
+#   [[profiles.tunnels]]
+#   kind = "local"
+#   local_port = 5432
+#   remote_host = "db.internal"
+#   remote_port = 5432
+
 [daemon]
 # pid_file / log_file 缺省时按平台自动选择：
 #   Windows: %LOCALAPPDATA%\ponte\

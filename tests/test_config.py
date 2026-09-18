@@ -801,3 +801,131 @@ local_port = 8080
     )
     cfg = load_config(path)
     assert [tunnel.kind for tunnel in cfg.tunnels] == ["remote", "dynamic"]
+
+
+# ---------------------------------------------------------------------------
+# profiles：一个配置里的多条 SSH 连接
+# ---------------------------------------------------------------------------
+
+
+def _profile_entry(tmp_path, name: str, tunnels: str | None = None) -> str:
+    """A ``[[profiles]]`` entry for *name*, with one -R tunnel by default."""
+    rules = tunnels if tunnels is not None else """
+[[profiles.tunnels]]
+remote_port = 23334
+local_host = "localhost"
+local_port = 2222
+"""
+    return f"""
+[[profiles]]
+name = "{name}"
+
+[profiles.ssh]
+host = "{name}.example.com"
+user = "u"
+identity_file = "{_toml_str(tmp_path / 'id_rsa')}"
+{rules}"""
+
+
+def test_profiles_parsed_independently(tmp_path) -> None:
+    """每个 profile 自带 ssh 与 tunnels，互不影响。"""
+    (tmp_path / "id_rsa").write_text("x", encoding="utf-8")
+    body = _profile_entry(tmp_path, "web") + _profile_entry(
+        tmp_path,
+        "db",
+        tunnels="""
+[[profiles.tunnels]]
+kind = "local"
+local_port = 5432
+remote_host = "db.internal"
+remote_port = 5432
+""",
+    )
+    cfg = load_config(_write_toml(tmp_path, body))
+
+    assert cfg.profile_names == ["web", "db"]
+    assert cfg.get_profile().name == "web", "缺省取第一个 profile"
+    assert cfg.get_profile("db").ssh.host == "db.example.com"
+    assert cfg.get_profile("db").destination == "u@db.example.com"
+    assert cfg.get_profile("db").tunnels[0].kind == "local"
+    # 兼容属性仍指向第一个 profile（单隧道调用方不必索引列表）。
+    assert cfg.ssh.host == "web.example.com"
+    assert cfg.tunnels == cfg.profiles[0].tunnels
+
+
+def test_get_profile_unknown_name_lists_configured(tmp_path) -> None:
+    cfg = load_config(_minimal(tmp_path))
+    with pytest.raises(ConfigError, match="unknown profile"):
+        cfg.get_profile("nope")
+    # 报错要列出已配置的名字，否则 --profile 手滑看起来就像隧道坏了。
+    with pytest.raises(ConfigError, match="default"):
+        cfg.get_profile("nope")
+
+
+def test_profiles_reject_top_level_ssh(tmp_path) -> None:
+    """两套写法混用是歧义的（顶层 tunnels 到底属于哪条连接？）。"""
+    (tmp_path / "id_rsa").write_text("x", encoding="utf-8")
+    body = f"""
+[ssh]
+host = "example.com"
+user = "u"
+identity_file = "{_toml_str(tmp_path / 'id_rsa')}"
+
+[[tunnels]]
+remote_port = 1
+local_host = "localhost"
+local_port = 2
+
+{_profile_entry(tmp_path, "web")}"""
+    with pytest.raises(ConfigValidationError, match="cannot be combined"):
+        load_config(_write_toml(tmp_path, body))
+
+
+def test_duplicate_profile_name_rejected(tmp_path) -> None:
+    (tmp_path / "id_rsa").write_text("x", encoding="utf-8")
+    body = _profile_entry(tmp_path, "web") + _profile_entry(tmp_path, "web")
+    with pytest.raises(ConfigValidationError, match="Duplicate profile name"):
+        load_config(_write_toml(tmp_path, body))
+
+
+@pytest.mark.parametrize("name", ["", "has space", "-leading", "sl/ash"])
+def test_profile_name_is_validated(tmp_path, name) -> None:
+    """名字会进 pid/状态文件名与 systemd 实例名，所以限定字符集。"""
+    (tmp_path / "id_rsa").write_text("x", encoding="utf-8")
+    with pytest.raises(ConfigValidationError):
+        load_config(_write_toml(tmp_path, _profile_entry(tmp_path, name)))
+
+
+def test_profile_needs_its_own_tunnel(tmp_path) -> None:
+    """profile 不是空壳：没有 tunnel 的连接没有意义。"""
+    (tmp_path / "id_rsa").write_text("x", encoding="utf-8")
+    body = _profile_entry(tmp_path, "web", tunnels="")
+    with pytest.raises(ConfigValidationError, match="web"):
+        load_config(_write_toml(tmp_path, body))
+
+
+def test_same_remote_port_across_profiles_is_allowed(tmp_path) -> None:
+    """不同服务器的同号端口不冲突：去重是按 profile 做的。"""
+    (tmp_path / "id_rsa").write_text("x", encoding="utf-8")
+    body = _profile_entry(tmp_path, "web") + _profile_entry(tmp_path, "db")
+    assert load_config(_write_toml(tmp_path, body)).profile_names == ["web", "db"]
+
+
+def test_profile_unknown_key_reports_full_path(tmp_path) -> None:
+    """profile 内部的拼写错误报到 profiles[0].ssh.x，而不是含糊的 ssh.x。"""
+    (tmp_path / "id_rsa").write_text("x", encoding="utf-8")
+    entry = _profile_entry(tmp_path, "web").replace(
+        'user = "u"', 'user = "u"\nhuost = "typo"'
+    )
+    cfg = load_config(_write_toml(tmp_path, entry))
+    assert any("profiles[0].ssh.huost" in warning for warning in cfg.warnings)
+
+
+def test_profile_invalid_identity_file_is_named(tmp_path) -> None:
+    """多 profile 时报错必须点名是哪个 profile 的密钥不存在。"""
+    (tmp_path / "id_rsa").write_text("x", encoding="utf-8")
+    body = _profile_entry(tmp_path, "web").replace(
+        _toml_str(tmp_path / "id_rsa"), _toml_str(tmp_path / "missing_key")
+    ) + _profile_entry(tmp_path, "db")
+    with pytest.raises(ConfigValidationError, match="web"):
+        load_config(_write_toml(tmp_path, body))
